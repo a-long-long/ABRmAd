@@ -4,6 +4,7 @@
 //! 随后在工具栏中删除选中的段（从检测结果中移除，保存时不再裁剪）。
 
 use egui::Context;
+use std::collections::HashSet;
 
 use super::super::state::{AppState, MatchMode, SharedState};
 
@@ -153,9 +154,11 @@ fn matching_pairs(
 fn select_matching(state: &SharedState, mode: MatchMode, min_score: f64, all_files: bool) {
     let mut s = state.lock().unwrap();
     let pairs = matching_pairs(&s, mode, min_score, all_files);
+    // 已选段用 HashSet 判重，避免逐个线性查找
+    let mut existing: HashSet<(usize, usize)> = s.ads_to_delete.iter().copied().collect();
     let mut added = 0;
     for pair in pairs {
-        if !s.ads_to_delete.contains(&pair) {
+        if existing.insert(pair) {
             s.ads_to_delete.push(pair);
             added += 1;
         }
@@ -166,7 +169,9 @@ fn select_matching(state: &SharedState, mode: MatchMode, min_score: f64, all_fil
 
 fn deselect_matching(state: &SharedState, mode: MatchMode, min_score: f64, all_files: bool) {
     let mut s = state.lock().unwrap();
-    let pairs = matching_pairs(&s, mode, min_score, all_files);
+    let pairs: HashSet<(usize, usize)> = matching_pairs(&s, mode, min_score, all_files)
+        .into_iter()
+        .collect();
     let before = s.ads_to_delete.len();
     s.ads_to_delete.retain(|p| !pairs.contains(p));
     let removed = before - s.ads_to_delete.len();

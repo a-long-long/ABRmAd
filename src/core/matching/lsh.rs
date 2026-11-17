@@ -231,7 +231,18 @@ pub fn hash_all(a: &Array2<f64>, window_size: usize) -> Vec<i32> {
 /// 返回与 `base_hash` 汉明距离 ≤ `PROBE_RADIUS` 的所有哈希值。
 /// 用于提高召回率：即使哈希因噪声翻转了几位，仍能找到匹配。
 pub fn multi_probe_hashes(base_hash: i32) -> Vec<i32> {
-    let mut probes = vec![base_hash];
+    let mut probes =
+        Vec::with_capacity(1 + NUM_HASH_BITS + NUM_HASH_BITS * (NUM_HASH_BITS - 1) / 2);
+    multi_probe_hashes_into(base_hash, &mut probes);
+    probes
+}
+
+/// 多探针 LSH 的复用版本：写入调用方提供的缓冲区
+///
+/// 热循环（逐帧生成候选）里复用一个 `Vec`，避免每次调用都重新分配。
+pub fn multi_probe_hashes_into(base_hash: i32, probes: &mut Vec<i32>) {
+    probes.clear();
+    probes.push(base_hash);
 
     if PROBE_RADIUS >= 1 {
         // 距离 1：翻转单个 bit
@@ -248,8 +259,6 @@ pub fn multi_probe_hashes(base_hash: i32) -> Vec<i32> {
             }
         }
     }
-
-    probes
 }
 
 #[cfg(test)]

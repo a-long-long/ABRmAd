@@ -34,10 +34,13 @@ pub(super) fn check_same_adaptive(
 
     // 先收集每个采样帧的全部候选取位置，再统一计算相似度（便于 GPU 批量处理）
     let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    // 复用的探针缓冲区，避免每个采样帧都重新分配
+    let mut probes: Vec<i32> = Vec::new();
     for (i, &h) in hash1.iter().enumerate().step_by(HASH_WINDOW_SIZE) {
         let mut positions = Vec::new();
         // 多探针 LSH：检查原始哈希 + 邻近哈希
-        for probe_h in lsh::multi_probe_hashes(h) {
+        lsh::multi_probe_hashes_into(h, &mut probes);
+        for &probe_h in &probes {
             if let Some(found) = pos.get(&probe_h) {
                 positions.extend_from_slice(found);
             }

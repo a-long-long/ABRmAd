@@ -23,16 +23,16 @@ pub(crate) fn average_score(
     file: &FileInfo,
     thresholds: crate::gui::state::Thresholds,
 ) -> Option<f64> {
-    let scored: Vec<f64> = file
-        .effective_ads(thresholds)
-        .filter(|r| r.score > 0.0)
-        .map(|r| r.score)
-        .collect();
-    if scored.is_empty() {
-        None
-    } else {
-        Some(scored.iter().sum::<f64>() / scored.len() as f64)
+    // 单次遍历累加，避免每帧为每个文件分配临时 Vec
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for r in file.effective_ads(thresholds) {
+        if r.score > 0.0 {
+            sum += r.score;
+            count += 1;
+        }
     }
+    (count > 0).then(|| sum / count as f64)
 }
 
 pub(crate) fn draw_file_track(

@@ -6,7 +6,7 @@
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use ndarray::Array2;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::audio::cache;
 use crate::core::dsp::features::{self, MEL_BANDS};
@@ -17,6 +17,8 @@ use super::super::state::{FileInfo, SharedState};
 const ENERGY_HEIGHT: f32 = 32.0;
 /// Mel 频谱高度
 const MEL_HEIGHT: f32 = 84.0;
+/// 源文件 mtime 的检查间隔，避免每帧都对文件做一次 stat 系统调用
+const MTIME_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 可视化纹理缓存（键为文件路径 + 修改时间，宽度变化时重建）
 pub struct VizCache {
@@ -24,56 +26,73 @@ pub struct VizCache {
     width: usize,
     energy: TextureHandle,
     mel: TextureHandle,
+    /// 上次检查源文件 mtime 的时间
+    last_check: Instant,
 }
 
 /// 绘制选中文件的能量包络与 Mel 频谱，并叠加广告段位置
 pub fn show(ui: &mut egui::Ui, state: &SharedState, file_idx: usize, file: &FileInfo) {
     let width = ui.available_width().max(64.0) as usize;
-    let key = (
-        file.path.clone(),
-        std::fs::metadata(&file.path)
-            .and_then(|m| m.modified())
-            .ok(),
-    );
 
-    // 命中缓存时只克隆纹理句柄（内部为 Arc），避免重复读取 FFT
+    // 1 秒内直接复用缓存，不对源文件做 stat；命中缓存时只克隆纹理句柄（内部为 Arc）
     let (cached, thresholds) = {
         let s = state.lock().unwrap();
-        (
-            s.viz_cache
-                .as_ref()
-                .filter(|c| c.key == key && c.width == width)
-                .map(|c| (c.energy.clone(), c.mel.clone())),
-            s.thresholds,
-        )
+        let cached = s.viz_cache.as_ref().and_then(|c| {
+            (c.width == width && c.last_check.elapsed() < MTIME_CHECK_INTERVAL)
+                .then(|| (c.energy.clone(), c.mel.clone()))
+        });
+        (cached, s.thresholds)
     };
 
     let (energy_tex, mel_tex) = match cached {
         Some(textures) => textures,
         None => {
-            let Some(fft) = cache::read_fft(&file.path) else {
-                ui.weak("频谱缓存不可用，请重新执行检测后再查看");
-                return;
+            // 到达检查间隔（或宽度变化）：stat 源文件并比对缓存键
+            let key = (
+                file.path.clone(),
+                std::fs::metadata(&file.path)
+                    .and_then(|m| m.modified())
+                    .ok(),
+            );
+            let existing = {
+                let s = state.lock().unwrap();
+                s.viz_cache
+                    .as_ref()
+                    .filter(|c| c.key == key && c.width == width)
+                    .map(|c| (c.energy.clone(), c.mel.clone()))
             };
+            if let Some(textures) = existing {
+                // 源文件未变：只刷新检查时间，避免重复读取 FFT
+                if let Some(c) = state.lock().unwrap().viz_cache.as_mut() {
+                    c.last_check = Instant::now();
+                }
+                textures
+            } else {
+                let Some(fft) = cache::read_fft(&file.path) else {
+                    ui.weak("频谱缓存不可用，请重新执行检测后再查看");
+                    return;
+                };
 
-            let energy = ui.ctx().load_texture(
-                format!("viz-energy-{file_idx}"),
-                energy_image(&fft, width, ENERGY_HEIGHT as usize),
-                TextureOptions::LINEAR,
-            );
-            let mel = ui.ctx().load_texture(
-                format!("viz-mel-{file_idx}"),
-                mel_image(&fft, width, MEL_HEIGHT as usize),
-                TextureOptions::LINEAR,
-            );
+                let energy = ui.ctx().load_texture(
+                    format!("viz-energy-{file_idx}"),
+                    energy_image(&fft, width, ENERGY_HEIGHT as usize),
+                    TextureOptions::LINEAR,
+                );
+                let mel = ui.ctx().load_texture(
+                    format!("viz-mel-{file_idx}"),
+                    mel_image(&fft, width, MEL_HEIGHT as usize),
+                    TextureOptions::LINEAR,
+                );
 
-            state.lock().unwrap().viz_cache = Some(VizCache {
-                key,
-                width,
-                energy: energy.clone(),
-                mel: mel.clone(),
-            });
-            (energy, mel)
+                state.lock().unwrap().viz_cache = Some(VizCache {
+                    key,
+                    width,
+                    energy: energy.clone(),
+                    mel: mel.clone(),
+                    last_check: Instant::now(),
+                });
+                (energy, mel)
+            }
         }
     };
 

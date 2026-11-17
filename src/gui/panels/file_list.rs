@@ -12,13 +12,31 @@ pub fn show(ctx: &Context, state: &SharedState) {
             ui.heading("文件列表");
             ui.separator();
 
-            let (files, selected, thresholds) = {
+            // 只快照渲染需要的少量字段，避免每帧克隆全部文件（含广告段/事件段）
+            struct Row {
+                name: String,
+                detected: bool,
+                ad_count: usize,
+                marked: usize,
+            }
+
+            let (rows, selected) = {
                 let s = state.lock().unwrap();
-                (s.files.clone(), s.selected_file, s.thresholds)
+                let rows: Vec<Row> = s
+                    .files
+                    .iter()
+                    .map(|f| Row {
+                        name: f.name.clone(),
+                        detected: f.detected,
+                        ad_count: f.effective_ad_count(s.thresholds),
+                        marked: f.marked_for_deletion.len(),
+                    })
+                    .collect();
+                (rows, s.selected_file)
             };
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for (idx, file) in files.iter().enumerate() {
+                for (idx, file) in rows.iter().enumerate() {
                     let is_selected = selected == Some(idx);
                     let bg_color = if is_selected {
                         egui::Color32::from_rgb(60, 100, 160)
@@ -44,14 +62,12 @@ pub fn show(ctx: &Context, state: &SharedState) {
                             if file.detected {
                                 ui.indent("ads", |ui| {
                                     // 与结果面板一致：只统计满足当前阈值的有效广告段
-                                    let ad_count = file.effective_ad_count(thresholds);
-                                    if file.marked_for_deletion.is_empty() {
-                                        ui.label(format!("广告: {} 个", ad_count));
+                                    if file.marked == 0 {
+                                        ui.label(format!("广告: {} 个", file.ad_count));
                                     } else {
                                         ui.label(format!(
                                             "广告: {} 个（已标记删除 {}）",
-                                            ad_count,
-                                            file.marked_for_deletion.len()
+                                            file.ad_count, file.marked
                                         ));
                                     }
                                 });

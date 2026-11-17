@@ -29,12 +29,17 @@ pub fn show(ctx: &Context, state: &SharedState) {
             (s.sort_by_score, s.thresholds)
         };
         if sort_by_score {
-            // 匹配度高的排在前面；未知匹配度（旧结果）排最后
-            all_files.sort_by(|a, b| {
-                let sa = average_score(&a.1, thresholds).unwrap_or(-1.0);
-                let sb = average_score(&b.1, thresholds).unwrap_or(-1.0);
-                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            // 匹配度高的排在前面；未知匹配度（旧结果）排最后。
+            // 每个文件的平均匹配度只计算一次，避免在比较器里反复遍历广告段。
+            let mut scored: Vec<(f64, (usize, FileInfo))> = all_files
+                .into_iter()
+                .map(|item| {
+                    let score = average_score(&item.1, thresholds).unwrap_or(-1.0);
+                    (score, item)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            all_files = scored.into_iter().map(|(_, item)| item).collect();
         }
 
         if all_files.is_empty() {
