@@ -38,7 +38,8 @@ pub(super) fn compress_range(ranges: &[Range]) -> Vec<Range> {
             if r.begin <= last.end {
                 last.begin = last.begin.min(r.begin);
                 last.end = last.end.max(r.end);
-                last.count += r.count;
+                // 合并后是同一个广告段，出现次数不应累加，取较大值
+                last.count = last.count.max(r.count);
                 last.score = last.score.max(r.score);
                 continue;
             }
@@ -221,6 +222,15 @@ mod tests {
         let ranges = vec![Range::new(100, 100, 2), Range::new(300, 200, 2)];
         assert_eq!(segments(&reverse_range(&ranges, 500)), vec![(0, 500)]);
         assert!(reverse_range(&ranges, 0).is_empty());
+    }
+
+    #[test]
+    fn compress_range_does_not_inflate_count() {
+        let ranges = vec![Range::new(100, 200, 2), Range::new(190, 210, 3)];
+        let out = compress_range(&ranges);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].begin, out[0].end), (100, 210));
+        assert_eq!(out[0].count, 3, "合并后 count 应取最大值而不是相加");
     }
 
     #[test]
