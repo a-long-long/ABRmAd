@@ -3,6 +3,7 @@
 //! 负责把两两比对得到的区间压缩为不重叠结果，并通过连通分量计算出现次数。
 
 use crate::core::range::{Link, Range};
+use std::collections::HashSet;
 
 use super::refine::create_range;
 
@@ -75,15 +76,15 @@ pub(super) fn calc_range_types(ranges: &mut [Vec<Range>], links: &[Link]) {
     for i in 0..ranges.len() {
         for j in 0..ranges[i].len() {
             if ranges[i][j].type_id == -1 {
-                let count = bfs_set_type(ranges, &adj, i, j, type_id);
-                counts.push(count);
+                let files = bfs_set_type(ranges, &adj, i, j, type_id);
+                counts.push(files as i32);
                 type_id += 1;
             }
         }
     }
 
-    // 用连通分量的大小更新 count，使其表示该广告的出现次数。
-    // 否则仅两个文件互相匹配时 count 仍为 1，会被后续 count > 1 的过滤误删。
+    // 用连通分量覆盖的文件数更新 count，使其表示该广告出现在多少个不同文件中。
+    // 旧实现按分量内区间数统计，同一文件产出多个区间时会重复计数。
     for file_ranges in ranges.iter_mut() {
         for r in file_ranges.iter_mut() {
             if r.type_id >= 0 {
@@ -98,23 +99,23 @@ pub(super) fn calc_range_types(ranges: &mut [Vec<Range>], links: &[Link]) {
     }
 }
 
-/// BFS 标记连通分量
+/// BFS 标记连通分量，返回分量覆盖的不同文件数
 fn bfs_set_type(
     ranges: &mut [Vec<Range>],
     adj: &[Vec<(usize, usize)>],
     start_i: usize,
     start_j: usize,
     type_id: i32,
-) -> i32 {
+) -> usize {
     let mut queue = vec![(start_i, start_j)];
-    let mut count = 0;
+    let mut files: HashSet<usize> = HashSet::new();
 
     while let Some((i, j)) = queue.pop() {
         if ranges[i][j].type_id == type_id {
             continue;
         }
         ranges[i][j].type_id = type_id;
-        count += 1;
+        files.insert(i);
 
         for &(ni, nj) in &adj[i] {
             if ranges[ni][nj].type_id == -1 {
@@ -123,7 +124,7 @@ fn bfs_set_type(
         }
     }
 
-    count
+    files.len()
 }
 
 /// 反转区间（获取非广告部分）
@@ -220,5 +221,30 @@ mod tests {
         let ranges = vec![Range::new(100, 100, 2), Range::new(300, 200, 2)];
         assert_eq!(segments(&reverse_range(&ranges, 500)), vec![(0, 500)]);
         assert!(reverse_range(&ranges, 0).is_empty());
+    }
+
+    #[test]
+    fn count_is_distinct_file_count() {
+        // file0 的两个区间都连接到 file1 的同一个区间：
+        // 分量覆盖 2 个文件，count 应为 2（旧实现按区间数会算成 3）
+        let mut ranges = vec![
+            vec![Range::new(100, 200, 1), Range::new(400, 500, 1)],
+            vec![Range::new(100, 200, 1)],
+        ];
+        let links = vec![
+            Link::new(0, 1, ranges[0][0], ranges[1][0]),
+            Link::new(0, 1, ranges[0][1], ranges[1][0]),
+        ];
+
+        calc_range_types(&mut ranges, &links);
+
+        for file_ranges in &ranges {
+            for r in file_ranges {
+                assert_eq!(r.count, 2, "count 应表示出现该广告的不同文件数");
+            }
+        }
+        // 出现于两个文件，不应被后续 count > 1 的过滤丢弃
+        assert_eq!(ranges[0].len(), 2);
+        assert_eq!(ranges[1].len(), 1);
     }
 }
