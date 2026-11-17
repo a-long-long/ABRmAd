@@ -169,7 +169,12 @@ where
                         data
                     }
                 };
-                let expected_hash_len = fft_data.nrows().saturating_sub(HASH_WINDOW_SIZE);
+                // 与 lsh::hash_all 的数量保持一致：最多有 len-window+1 个完整窗口
+                let expected_hash_len = if fft_data.nrows() >= HASH_WINDOW_SIZE {
+                    fft_data.nrows() - HASH_WINDOW_SIZE + 1
+                } else {
+                    0
+                };
                 let hash_data = match cache::read_hash(mp3_path) {
                     Some(h) if h.len() == expected_hash_len => h,
                     _ => {

@@ -214,11 +214,13 @@ pub fn hash(a: &Array2<f64>, offset: usize) -> i32 {
 /// 批量计算哈希值（使用 rayon 并行加速）
 pub fn hash_all(a: &Array2<f64>, window_size: usize) -> Vec<i32> {
     let len = a.nrows();
-    if len < window_size {
+    if window_size == 0 || len < window_size {
         return Vec::new();
     }
 
-    (0..len - window_size)
+    // 合法起点是 0..=len-window_size，共 len-window_size+1 个；
+    // 写成 len-window_size 会漏掉最后一个完整窗口
+    (0..=len - window_size)
         .into_par_iter()
         .map(|i| hash(a, i))
         .collect()
@@ -313,5 +315,22 @@ mod tests {
         // 切回原维度也应正常
         init(10, 32);
         assert_eq!(hash(&a, 0), hash(&a, 0));
+    }
+
+    #[test]
+    fn test_hash_all_covers_last_window() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        init(5, 8);
+
+        let a: Array2<f64> = Array2::from_shape_fn((7, 8), |(i, j)| ((i * 8 + j) as f64).sin());
+
+        // 长度 7、窗口 5：合法起点为 0、1、2，共 3 个
+        assert_eq!(hash_all(&a, 5).len(), 3);
+
+        // 恰好一个完整窗口时也必须产生一个哈希
+        init(7, 8);
+        assert_eq!(hash_all(&a, 7).len(), 1);
+        // 窗口大于长度时没有完整窗口
+        assert!(hash_all(&a, 8).is_empty());
     }
 }
