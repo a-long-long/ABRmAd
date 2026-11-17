@@ -80,7 +80,8 @@ pub(crate) fn start_classification(state: &SharedState) {
     let model = Arc::new(model);
     thread::spawn(move || {
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let mut all_events: Vec<(Vec<EventRange>, usize)> = Vec::with_capacity(n_files);
+            // 第三项标记该文件是否分类成功，失败文件不伪装成“已分类”
+            let mut all_events: Vec<(Vec<EventRange>, usize, bool)> = Vec::with_capacity(n_files);
 
             for (i, path) in files.iter().enumerate() {
                 let progress_state = state.clone();
@@ -92,13 +93,13 @@ pub(crate) fn start_classification(state: &SharedState) {
                     }
                 };
 
-                let events = match crate::core::classify::classify_file_with_progress(
+                let (events, ok) = match crate::core::classify::classify_file_with_progress(
                     path,
                     &model,
                     &opts,
                     on_progress,
                 ) {
-                    Ok((ev, _nf)) => ev,
+                    Ok((ev, _nf)) => (ev, true),
                     Err(e) => {
                         if let Ok(mut s) = state.lock() {
                             s.status_message = format!(
@@ -109,10 +110,10 @@ pub(crate) fn start_classification(state: &SharedState) {
                                 e
                             );
                         }
-                        Vec::new()
+                        (Vec::new(), false)
                     }
                 };
-                all_events.push((events, i));
+                all_events.push((events, i, ok));
             }
             all_events
         }));
@@ -122,16 +123,28 @@ pub(crate) fn start_classification(state: &SharedState) {
                 // 写回结果
                 let mut s = state.lock().unwrap();
                 let mut total_events = 0;
-                for (events, idx) in all_events {
+                let mut failed = 0;
+                for (events, idx, ok) in all_events {
                     if let Some(f) = s.files.get_mut(idx) {
                         f.event_ranges = events.clone();
-                        f.classified = true;
-                        total_events += events.len();
+                        f.classified = ok;
+                        if ok {
+                            total_events += events.len();
+                        } else {
+                            failed += 1;
+                        }
                     }
                 }
                 s.is_processing = false;
                 s.progress = 1.0;
-                s.status_message = format!("分类完成！共检测到 {} 个事件", total_events);
+                let mut message = format!("分类完成！共检测到 {} 个事件", total_events);
+                if failed > 0 {
+                    message.push_str(&format!(
+                        " {} 个文件分类失败已跳过（请检查文件是否损坏或格式不支持）",
+                        failed
+                    ));
+                }
+                s.status_message = message;
             }
             Err(_) => {
                 let mut s = state.lock().unwrap();
