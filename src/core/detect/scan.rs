@@ -134,13 +134,16 @@ fn gpu_best_matches_recheck(
         // 按 GPU f32 分数降序取前 TOP_RECHECK 个候选索引
         let mut ranked: Vec<usize> = (0..n).collect();
         let take = TOP_RECHECK.min(n);
-        // 用 partial sort（前 take 个有序），避免全量排序
-        ranked.select_nth_unstable_by(take, |&a, &b| {
-            let sa = scores[k + a];
-            let sb = scores[k + b];
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        ranked.truncate(take);
+        // 用 partial sort（前 take 个有序），避免全量排序。
+        // take == n 时全部候选入选，且 select_nth 的索引会越界 panic，必须跳过。
+        if take < n {
+            ranked.select_nth_unstable_by(take, |&a, &b| {
+                let sa = scores[k + a];
+                let sb = scores[k + b];
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            ranked.truncate(take);
+        }
         // 对选出的 top-K 再排一次，确保顺序稳定（可能不需要，但无害）
         ranked.sort_by(|&a, &b| {
             let sa = scores[k + a];
@@ -357,5 +360,37 @@ mod tests {
 
             k += n;
         }
+    }
+
+    /// 候选数不超过 TOP_RECHECK 的帧组也必须能正常参与粗筛+精算
+    #[test]
+    fn gpu_recheck_handles_small_groups() {
+        if gpu::backend_name().is_none() {
+            eprintln!("未检测到可用 GPU，跳过");
+            return;
+        }
+
+        let (fft1, fft2) = make_spectra();
+        // 第一组只有 1 个候选；第二组足够大，使总配对数超过 GPU 的最小阈值
+        let groups: Vec<(usize, Vec<usize>)> =
+            vec![(0, vec![0]), (4, (0..600).map(|k| k % 100).collect())];
+
+        let mut pairs = Vec::new();
+        for &(i, ref positions) in &groups {
+            for &p in positions {
+                pairs.push((i, p));
+            }
+        }
+        let scores =
+            gpu::cosine_pairs(&fft1, &fft2, &pairs, HASH_WINDOW_SIZE).expect("GPU 应返回结果");
+
+        let out = gpu_best_matches_recheck(&fft1, &fft2, &groups, &scores);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].1, 0);
+        assert_eq!(
+            out[0].2,
+            lsh::cosine_sim(&fft1, &fft2, 0, 0, HASH_WINDOW_SIZE)
+        );
     }
 }
