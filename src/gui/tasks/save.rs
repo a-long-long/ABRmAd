@@ -118,16 +118,12 @@ fn save_all(state: &SharedState) {
                 s.progress = done as f32 / total as f32;
                 s.status_message = format!("保存进度: {}/{}", done, total);
                 if let Some(f) = s.files.get_mut(file_idx) {
-                    f.needs_save = false;
-                    f.marked_for_deletion.clear();
-                    // 覆盖后磁盘文件已变短，旧的时间轴与区间不能再用于二次裁剪
-                    if overwrite {
-                        f.reset_detection();
-                    }
+                    // 保存成功后从右侧结果区移除该文件（左侧文件列表保留，可重新检测）。
+                    // 覆盖模式下磁盘文件已变短，旧时间轴更不能继续使用。
+                    f.reset_detection();
                 }
-                if overwrite {
-                    s.ads_to_delete.retain(|&(fi, _)| fi != file_idx);
-                }
+                // 清理该文件残留的勾选状态
+                s.ads_to_delete.retain(|&(fi, _)| fi != file_idx);
             }
             Err(e) => {
                 failures.push(format!("{}: {}", file.name, e));
@@ -148,7 +144,7 @@ fn save_all(state: &SharedState) {
             )
         } else {
             format!(
-                "保存完成！输出目录: {} ({} 个文件)",
+                "保存完成！输出目录: {} ({} 个文件)，已从结果区移除",
                 output_dir.unwrap().display(),
                 saved
             )
