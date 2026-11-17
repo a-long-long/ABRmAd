@@ -1,12 +1,23 @@
 
 use ndarray::Array2;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// 单棵树最大深度上限，防止极端配置导致递归过深
 pub const MAX_DEPTH_CAP: usize = 64;
+
+/// bootstrap 采样模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BootstrapMode {
+    /// 完全随机有放回采样（原实现）
+    Random,
+    /// 按类别分层，每类独立有放回采样，保持原始类别比例
+    #[default]
+    Stratified,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForestParams {
@@ -15,11 +26,21 @@ pub struct ForestParams {
     pub min_samples_split: usize,
     pub max_features: usize,
     pub seed: u64,
+    /// bootstrap 采样模式，默认分层采样以缓解类别不平衡
+    #[serde(default)]
+    pub bootstrap: BootstrapMode,
 }
 
 impl Default for ForestParams {
     fn default() -> Self {
-        Self { n_trees: 100, max_depth: 32, min_samples_split: 2, max_features: 0, seed: 42 }
+        Self {
+            n_trees: 100,
+            max_depth: 32,
+            min_samples_split: 2,
+            max_features: 0,
+            seed: 42,
+            bootstrap: BootstrapMode::Stratified,
+        }
     }
 }
 
@@ -50,11 +71,9 @@ impl Forest {
         let nc = n_classes.unwrap_or_else(|| y.iter().max().copied().unwrap_or(0) + 1).max(1);
         let mf = if params.max_features == 0 { (dim as f64).sqrt() as usize } else { params.max_features.min(dim) };
         let max_depth = params.max_depth.clamp(1, MAX_DEPTH_CAP);
-        let indices: Vec<usize> = (0..n_samples).collect();
         let trees: Vec<Vec<Node>> = (0..params.n_trees).into_par_iter().map(|t| {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ (t as u64 + 1));
-            let mut boot = Vec::with_capacity(n_samples);
-            for _ in 0..n_samples { boot.push(*indices.choose(&mut rng).unwrap()); }
+            let boot = bootstrap_indices(y, params.bootstrap, &mut rng, n_samples);
             let bx: Vec<Vec<f64>> = boot.iter().map(|&i| x.row(i).to_vec()).collect();
             let by: Vec<usize> = boot.iter().map(|&i| y[i]).collect();
             let mut tree = Vec::new();
@@ -73,6 +92,34 @@ impl Forest {
         let n = self.trees.len().max(1) as f64;
         for v in s.iter_mut() { *v /= n; }
         s
+    }
+}
+
+/// 生成单棵树的 bootstrap 采样索引
+fn bootstrap_indices<R: Rng>(
+    y: &[usize],
+    mode: BootstrapMode,
+    rng: &mut R,
+    n_samples: usize,
+) -> Vec<usize> {
+    match mode {
+        // 原实现：完全随机有放回采样
+        BootstrapMode::Random => (0..n_samples).map(|_| rng.gen_range(0..n_samples)).collect(),
+        // 每类独立有放回采样，采样数等于该类样本数，从而保持类别比例
+        BootstrapMode::Stratified => {
+            let mut by_class: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            for (i, &label) in y.iter().enumerate() {
+                by_class.entry(label).or_default().push(i);
+            }
+            let mut boot = Vec::with_capacity(n_samples);
+            for indices in by_class.values() {
+                for _ in 0..indices.len() {
+                    boot.push(indices[rng.gen_range(0..indices.len())]);
+                }
+            }
+            boot.shuffle(rng);
+            boot
+        }
     }
 }
 
@@ -145,4 +192,24 @@ fn class_proba(y: &[usize], nc: usize) -> Vec<f64> {
 fn gini(y: &[usize], nc: usize) -> f64 {
     let p = class_proba(y, nc);
     1.0 - p.iter().map(|x| x * x).sum::<f64>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stratified_bootstrap_preserves_class_ratio() {
+        // 9:1 不平衡样本
+        let mut y = vec![0usize; 90];
+        y.extend_from_slice(&[1usize; 10]);
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let boot = bootstrap_indices(&y, BootstrapMode::Stratified, &mut rng, y.len());
+
+        assert_eq!(boot.len(), y.len(), "采样总数应保持不变");
+        let zeros = boot.iter().filter(|&&i| y[i] == 0).count();
+        assert_eq!(zeros, 90, "多数类采样数应等于原始样本数");
+        assert_eq!(boot.len() - zeros, 10, "少数类采样数应等于原始样本数");
+    }
 }
