@@ -34,11 +34,14 @@ pub struct VizCache {
 pub fn show(ui: &mut egui::Ui, state: &SharedState, file_idx: usize, file: &FileInfo) {
     let width = ui.available_width().max(64.0) as usize;
 
-    // 1 秒内直接复用缓存，不对源文件做 stat；命中缓存时只克隆纹理句柄（内部为 Arc）
+    // 1 秒内直接复用缓存，不对源文件做 stat；命中缓存时只克隆纹理句柄（内部为 Arc）。
+    // 必须同时比对路径，否则切换选中文件后会短暂显示上一个文件的频谱。
     let (cached, thresholds) = {
         let s = state.lock().unwrap();
         let cached = s.viz_cache.as_ref().and_then(|c| {
-            (c.width == width && c.last_check.elapsed() < MTIME_CHECK_INTERVAL)
+            (c.key.0 == file.path
+                && c.width == width
+                && c.last_check.elapsed() < MTIME_CHECK_INTERVAL)
                 .then(|| (c.energy.clone(), c.mel.clone()))
         });
         (cached, s.thresholds)
