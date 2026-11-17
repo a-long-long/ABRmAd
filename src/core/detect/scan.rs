@@ -214,10 +214,14 @@ mod tests {
     }
 
     /// 构造每个帧组都有多个近优候选的 groups
+    ///
+    /// 步长取 2 而不是整个窗口，是为了让候选配对总数超过
+    /// `gpu::MIN_PAIRS_FOR_GPU`（低于该值时 GPU 接口会主动回退 CPU），
+    /// 否则测试根本走不到 GPU 路径。
     fn make_groups(a_rows: usize, b_rows: usize) -> Vec<(usize, Vec<usize>)> {
         let window = HASH_WINDOW_SIZE;
         let mut groups = Vec::new();
-        for i in (0..=a_rows.saturating_sub(window)).step_by(window) {
+        for i in (0..=a_rows.saturating_sub(window)).step_by(2) {
             // 每个帧组给 16 个候选，其中包含真实最优位置
             let b_max = b_rows.saturating_sub(window);
             let mut positions = Vec::new();
