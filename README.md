@@ -1,4 +1,4 @@
-# ABRmAd-RS
+# ABRmAd
 
 音频广告检测与裁剪工具。通过音频指纹匹配，找出多个音频文件中重复出现的片段（通常是广告），并自动裁剪掉这些片段。
 
@@ -47,7 +47,7 @@ build.bat
 
 脚本依次构建库、CLI、GUI，并把产物复制到 `release\` 目录：
 
-- `release\ABRmAd-RS.exe`（由 `abrmad-gui.exe` 复制并重命名，只保留这一个 GUI 文件）
+- `release\ABRmAd.exe`（由 `abrmad-gui.exe` 复制并重命名，只保留这一个 GUI 文件）
 - `release\abrmad-cli.exe`
 - `release\abrmad_rs.dll`
 
@@ -79,7 +79,7 @@ cargo build --release --features cli,gui,gpu
 | `abrmad-gui.exe` | 图形界面程序 |
 | `abrmad_rs.dll` | C ABI 动态库 |
 
-分发时可将 `abrmad-gui.exe` 重命名为 `ABRmAd-RS.exe`，或直接运行 `build.bat` 让它自动完成复制。三个文件均可单独拷出使用，但运行环境仍需安装 FFmpeg 并加入 `PATH`。
+分发时可将 `abrmad-gui.exe` 重命名为 `ABRmAd.exe`，或直接运行 `build.bat` 让它自动完成复制。三个文件均可单独拷出使用，但运行环境仍需安装 FFmpeg 并加入 `PATH`。
 
 ### 开发与调试
 
@@ -137,7 +137,7 @@ $env:RUST_LOG="debug"; cargo run --features gui --bin abrmad-gui
 
 ## 图形界面
 
-直接运行 `release\ABRmAd-RS.exe`（开发构建可直接运行 `target\release\abrmad-gui.exe`）：
+直接运行 `release\ABRmAd.exe`（开发构建可直接运行 `target\release\abrmad-gui.exe`）：
 
 1. **添加文件 / 添加目录**：支持上述 8 种音频格式
 2. **检测广告**：状态栏显示实时进度（预处理音频 i/N、比对音频片段 i/M）；勾选「HPSS 分离」会在预处理阶段先做谐波-打击乐分离，只对打击乐轨道检测，适合广告段混有背景音乐的素材

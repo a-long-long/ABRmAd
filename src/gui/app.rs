@@ -64,7 +64,7 @@ pub fn run() -> eframe::Result<()> {
             .with_inner_size([1000.0, 600.0])
             .with_min_inner_size([800.0, 400.0])
             .with_icon(std::sync::Arc::new(icon))
-            .with_title("ABRmAd-RS - MP3 广告检测与裁剪"),
+            .with_title("ABRmAd - MP3 广告检测与裁剪"),
         // 强制使用 OpenGL/Glow 渲染后端：
         // 默认 wgpu 优先走 Vulkan，在缺少 Vulkan 驱动的环境（如部分 ARM/虚拟显示）
         // 会初始化卡死；Glow 直接走 OpenGL，兼容性更好。
@@ -73,7 +73,7 @@ pub fn run() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "ABRmAd-RS",
+        "ABRmAd",
         options,
         Box::new(|cc| {
             fonts::setup_chinese_font(&cc.egui_ctx);
