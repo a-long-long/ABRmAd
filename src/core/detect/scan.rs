@@ -288,7 +288,7 @@ mod tests {
         let (fft1, fft2) = make_spectra();
         let groups = make_groups(fft1.nrows(), fft2.nrows());
 
-        let mut gpu_used = AtomicBool::new(false);
+        let gpu_used = AtomicBool::new(false);
         let gpu_out = best_matches(&fft1, &fft2, &groups, &gpu_used);
         assert!(
             gpu_used.load(std::sync::atomic::Ordering::Relaxed),

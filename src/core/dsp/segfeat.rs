@@ -78,7 +78,7 @@ fn stft_power(samples: &[f64]) -> Array2<f64> {
     let bins = n_fft / 2 + 1;
     let mut result = Array2::<f64>::zeros((n_frames, bins));
     let mut planner = FftPlanner::<f64>::new();
-    let mut fft = planner.plan_fft_forward(n_fft);
+    let fft = planner.plan_fft_forward(n_fft);
     let mut buf = vec![Complex64::default(); n_fft];
     for fi in 0..n_frames {
         let start = fi * hop;
@@ -221,7 +221,6 @@ pub fn extract_segment_features(samples: &[f64]) -> Result<[f64; SEG_FEATURE_DIM
     out[idx] = a;
     idx += 1;
     out[idx] = b;
-    idx += 1;
     Ok(out)
 }
 

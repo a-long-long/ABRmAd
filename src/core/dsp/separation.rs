@@ -140,7 +140,7 @@ fn stft_complex(samples: &[f64], n_fft: usize, hop: usize) -> Vec<Vec<(f64, f64)
     let bins = n_fft / 2 + 1;
     let mut result: Vec<Vec<(f64, f64)>> = vec![vec![(0.0, 0.0); bins]; n_frames];
     let mut planner = FftPlanner::<f64>::new();
-    let mut fft = planner.plan_fft_forward(n_fft);
+    let fft = planner.plan_fft_forward(n_fft);
     let mut buf = vec![Complex64::new(0.0, 0.0); n_fft];
     for fi in 0..n_frames {
         let start = fi * hop;
@@ -191,7 +191,7 @@ fn istft(spec: &[Vec<(f64, f64)>], n_fft: usize, hop: usize) -> Vec<f64> {
 
     let bins = spec[0].len();
     let mut planner = FftPlanner::<f64>::new();
-    let mut fft_inv = planner.plan_fft_inverse(n_fft);
+    let fft_inv = planner.plan_fft_inverse(n_fft);
     let mut buf = vec![Complex64::new(0.0, 0.0); n_fft];
 
     for fi in 0..n_frames {
