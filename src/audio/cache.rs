@@ -124,8 +124,13 @@ fn load_fft(path: &Path) -> Result<Array2<f64>> {
     let nrows = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
     let ncols = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
     let cells = nrows.checked_mul(ncols).context("FFT 缓存头信息溢出")?;
+    // 期望长度同样用 checked 运算计算，避免伪造头信息在 debug 构建下整数溢出 panic
+    let expected_len = cells
+        .checked_mul(8)
+        .and_then(|data_bytes| data_bytes.checked_add(8))
+        .context("FFT 缓存头信息溢出")?;
 
-    if buf.len() != 8 + cells * 8 {
+    if buf.len() != expected_len {
         bail!("FFT 缓存文件损坏（数据长度不匹配）: {}", path.display());
     }
 
@@ -176,5 +181,23 @@ mod tests {
     fn test_file_key_stable_for_same_path() {
         let a = Path::new("C:/music/track.mp3");
         assert_eq!(file_key(a), file_key(a));
+    }
+
+    #[test]
+    fn load_fft_rejects_overflowing_header() {
+        // 伪造 nrows = ncols = u32::MAX，使 cells * 8 溢出；应返回错误而不是 panic
+        let path = std::env::temp_dir().join(format!(
+            "abrmad_fft_overflow_{}_{}.fft",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, &buf).unwrap();
+
+        let err = load_fft(&path).unwrap_err();
+        assert!(err.to_string().contains("溢出"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(&path);
     }
 }
