@@ -147,13 +147,16 @@ where
                     idx,
                     rand::random::<u32>()
                 ));
-                write_f64_wav(&tmp_wav, &perc)?;
-
-                let fft = fft::process_wav(&tmp_wav)?;
-                let hash = lsh::hash_all(&fft, HASH_WINDOW_SIZE);
+                // 先写再算，无论中间哪一步失败都清理临时文件，避免失败路径在临时目录残留
+                let processed = write_f64_wav(&tmp_wav, &perc)
+                    .and_then(|_| fft::process_wav(&tmp_wav))
+                    .map(|fft| {
+                        let hash = lsh::hash_all(&fft, HASH_WINDOW_SIZE);
+                        (fft, hash)
+                    });
                 let _ = std::fs::remove_file(&wav_path);
                 let _ = std::fs::remove_file(&tmp_wav);
-                (fft, hash)
+                processed?
             } else {
                 // 常规路径：使用缓存
                 let fft_data = match cache::read_fft(mp3_path) {
