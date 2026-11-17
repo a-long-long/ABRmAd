@@ -130,11 +130,14 @@ pub fn extract_segment_features(samples: &[f64]) -> Result<[f64; SEG_FEATURE_DIM
     let n_bands = SEG_CONTRAST_BANDS + 1;
     let freq_bands = contrast_band_edges(n_freq, SEG_SR, SEG_CONTRAST_BANDS);
     let mut contrast = Array2::<f64>::zeros((n_frames, n_bands));
+    // 复用同一个缓冲区收集每个频带的取值，避免逐帧逐频带分配小 Vec
+    let mut vals: Vec<f64> = Vec::with_capacity(n_freq);
     for t in 0..n_frames {
         for b in 0..n_bands {
             let fl = freq_bands[b];
             let fh = freq_bands[b + 1];
-            let mut vals: Vec<f64> = (fl..fh).map(|k| (power[[t, k]] + 1e-12).log10()).collect();
+            vals.clear();
+            vals.extend((fl..fh).map(|k| (power[[t, k]] + 1e-12).log10()));
             if vals.is_empty() {
                 continue;
             }
