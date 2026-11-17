@@ -101,7 +101,8 @@ pub fn classify_samples(
         let mut bc = None;
         let mut bn = 0;
         for (cls, n) in &cnt {
-            if *n > bn {
+            // 票数相同时按标签序号取小，避免 HashMap 迭代顺序导致结果不确定
+            if *n > bn || (*n == bn && bc.is_none_or(|c| *cls < c)) {
                 bn = *n;
                 bc = Some(*cls);
             }

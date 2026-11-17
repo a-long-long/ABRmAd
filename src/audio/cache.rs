@@ -147,7 +147,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp = path.with_file_name(format!("{}.{}.tmp", file_name, std::process::id()));
+    // 同一进程内可能有多个线程写入同一个缓存键，临时文件名必须唯一
+    let tmp = path.with_file_name(format!(
+        "{}.{}.{:08x}.tmp",
+        file_name,
+        std::process::id(),
+        rand::random::<u32>()
+    ));
 
     std::fs::write(&tmp, bytes)?;
     let _ = std::fs::remove_file(path);
