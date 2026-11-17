@@ -48,7 +48,7 @@ pub fn load_model(path: &Path) -> Result<ModelFile> {
     }
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic).context("模型文件头不完整")?;
-    if magic != *MODEL_MAGIC { bail!("不是有效的 MP3CutAd 模型文件"); }
+    if magic != *MODEL_MAGIC { bail!("不是有效的 ABRmAd 模型文件"); }
     let mut ver_buf = [0u8; 4];
     file.read_exact(&mut ver_buf).context("模型版本字段缺失")?;
     let version = u32::from_le_bytes(ver_buf);

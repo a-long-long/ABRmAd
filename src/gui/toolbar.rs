@@ -13,7 +13,7 @@ use super::tasks::save;
 pub fn menu_bar(ctx: &Context, state: &SharedState) {
     egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
-            ui.heading("MP3CutAd-RS");
+            ui.heading("ABRmAd-RS");
             ui.separator();
 
             let is_processing = state.lock().unwrap().is_processing;

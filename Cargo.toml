@@ -1,19 +1,19 @@
 [package]
-name = "mp3cutad-rs"
+name = "abrmad-rs"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "mp3cutad_rs"
+name = "abrmad_rs"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "mp3cutad-cli"
+name = "abrmad-cli"
 path = "src/main.rs"
 required-features = ["cli"]
 
 [[bin]]
-name = "mp3cutad-gui"
+name = "abrmad-gui"
 path = "src/gui_main.rs"
 required-features = ["gui"]
 

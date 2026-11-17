@@ -1,4 +1,4 @@
-# MP3CutAd-RS GUI 使用说明
+# ABRmAd-RS GUI 使用说明
 
 基于 egui 的跨平台音频广告检测 + 事件分类 + HPSS 源分离工具。
 
@@ -8,7 +8,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ MP3CutAd-RS  │ 添加文件 │ 检测广告 │ HPSS 分离 │ 📂模型│🎯分类│... │ ← 顶部工具栏
+│ ABRmAd-RS  │ 添加文件 │ 检测广告 │ HPSS 分离 │ 📂模型│🎯分类│... │ ← 顶部工具栏
 ├──────────────┬──────────────────────────────────────────────────────┤
 │ 左侧文件列表  │  中央结果面板（音频条 + 事件轨道 + 图例）              │
 │              │                                                      │
@@ -517,7 +517,7 @@ GUI 的 🎯 分类事件功能需要先训练 `.mcrf` 模型文件。用 CLI �
 #    /data/jingle_b.wav 噪声
 
 # 2. 训练（自动 2s 窗口扩展）
-mp3cutad-cli train \
+abrmad-cli train \
   -d data.txt \
   -o model.mcrf \
   --trees 200 \
@@ -632,14 +632,14 @@ A: GUI 选模型时即时 load_model 验证，七重校验任何一项失败都�
 cargo build --release --features cli,gui
 
 # GUI
-./target/release/mp3cutad-gui
+./target/release/abrmad-gui
 
 # CLI 检测（可选 HPSS）
-mp3cutad-cli detect file1.mp3 file2.mp3 --hpss -o result.json
+abrmad-cli detect file1.mp3 file2.mp3 --hpss -o result.json
 
 # CLI 训练事件分类模型
-mp3cutad-cli train -d data.txt -o model.mcrf --trees 200
+abrmad-cli train -d data.txt -o model.mcrf --trees 200
 
 # CLI 事件分类
-mp3cutad-cli classify song.wav -m model.mcrf --confidence 0.45
+abrmad-cli classify song.wav -m model.mcrf --confidence 0.45
 ```

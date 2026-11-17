@@ -15,7 +15,7 @@ use crate::training::{TrainConfig, TrainSample};
 use crate::{pipeline, result_io};
 
 #[derive(Parser)]
-#[command(name = "mp3cutad-rs")]
+#[command(name = "abrmad-rs")]
 #[command(about = "MP3 广告检测与裁剪工具 (Rust 版本)", long_about = None)]
 #[command(version = "0.1.0")]
 struct Cli {

@@ -2,10 +2,10 @@
 
 #[cfg(feature = "cli")]
 fn main() -> anyhow::Result<()> {
-    mp3cutad_rs::cli::run()
+    abrmad_rs::cli::run()
 }
 
 #[cfg(not(feature = "cli"))]
 fn main() {
-    println!("This is a library. Use mp3cutad-cli for command line interface.");
+    println!("This is a library. Use abrmad-cli for command line interface.");
 }

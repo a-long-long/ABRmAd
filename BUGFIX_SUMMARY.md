@@ -21,7 +21,7 @@
 
 | # | 问题 | 风险 | 修复 | 文件 |
 |---|------|------|------|------|
-| 2 | FFI `mp3cutad_detect`/`mp3cutad_cut` Rust panic 穿透到 C → 段错误 | 进程崩溃 | 入口 `catch_unwind` 包裹；入参指针/长度 malloc 判空；返回 `errno=-1` | `src/ffi.rs` |
+| 2 | FFI `abrmad_detect`/`abrmad_cut` Rust panic 穿透到 C → 段错误 | 进程崩溃 | 入口 `catch_unwind` 包裹；入参指针/长度 malloc 判空；返回 `errno=-1` | `src/ffi.rs` |
 | 4 | `compress_range` 先外层遍历再内层找首个相交合并，残留重叠 `[[1,5],[3,12],[10,15]]` → `[[1,12],[10,15]]` | 裁剪区间错误 | 重写为**排序 + 单次线性扫描**，相交即 merge last | `src/core/detect/merge.rs` |
 | 5 | `reverse_range` 未排序，gap 计算依赖输入已排 | 反演区间错误 | 先 `sort_by_key(begin)`，gap_begin = prev.end.max(0) | `src/core/detect/merge.rs` |
 | 6 | `reverse_range` 对 count≤1 的非区间值未过滤 | 除零/无效区间 | filter(count<=1 \|\| begin>=end) 后再反演 | `src/core/detect/merge.rs` |
@@ -41,7 +41,7 @@
 |---|------|------|------|------|
 | 11 | GUI 后台线程 panic 时 `is_processing` 不复位 → 界面永久卡死 | UX 死锁 | `save.rs` drop guard + catch_unwind；`toolbar.rs` 列表操作 `!is_processing` 守卫；检测/分类 spawn 也 catch_unwind | `src/gui/tasks/save.rs`, `src/gui/toolbar.rs`, `src/gui/tasks/{detect,classify}.rs` |
 | 13 | `bits_per_sample==0` → `1i64 << -1` 移位溢出；立体声 `chunks(2)` 遇奇数采样静默丢失 | 解码崩溃 | bits 先校验 ∈(0,64] 否则 bail；`chunks_exact(channels)` 丢弃尾部残缺；任意声道数统一处理 | `src/core/dsp/fft.rs` |
-| 14 | HPSS 临时文件名只用 idx=0/1/2，多进程/崩溃残留冲突 | 文件互相覆盖 | 四元组命名 `mp3cutad_hpss_{pid}_{毫秒时间戳}_{idx}_{rand_u32}.wav` | `src/core/detect/mod.rs` |
+| 14 | HPSS 临时文件名只用 idx=0/1/2，多进程/崩溃残留冲突 | 文件互相覆盖 | 四元组命名 `abrmad_hpss_{pid}_{毫秒时间戳}_{idx}_{rand_u32}.wav` | `src/core/detect/mod.rs` |
 | 15 | `model.hop_sec as i32 * 10` 浮点截断（如 0.15s → 1 而非 2） | 事件结束时间偏差 | 统一改为 `hop_01 = (model.hop_sec * 10.0).round() as i32` | `src/core/classify/mod.rs` |
 | 16 | `result_io::load()` 头部 `num_files`/`num_ranges` 无上限，损坏文件触发 OOM | 内存耗尽 | 加 `MAX_FILES=10_000` / `MAX_RANGES_PER_FILE=100_000`，超限 bail | `src/result_io.rs` |
 

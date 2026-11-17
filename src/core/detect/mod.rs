@@ -133,7 +133,7 @@ where
                 let perc = separation::separate_percussive(&raw)?;
                 // 文件名加 pid + 时间戳 + 随机，避免多进程/并发运行冲突，崩溃后残留也不会互相覆盖
                 let tmp_wav = std::env::temp_dir().join(format!(
-                    "mp3cutad_hpss_{}_{}_{}_{}.wav",
+                    "abrmad_hpss_{}_{}_{}_{}.wav",
                     std::process::id(),
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)

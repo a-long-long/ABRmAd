@@ -62,7 +62,7 @@ pub type ProgressCallback = extern "C" fn(used: c_int, left: c_int, user_data: *
 /// # Safety
 /// 此函数接收原始指针，调用者需确保指针有效
 #[no_mangle]
-pub unsafe extern "C" fn mp3cutad_detect(
+pub unsafe extern "C" fn abrmad_detect(
     files_ptr: *const *const c_char,
     files_count: c_int,
     _progress_cb: Option<ProgressCallback>,
@@ -124,7 +124,7 @@ pub unsafe extern "C" fn mp3cutad_detect(
                 range_counts: std::ptr::null_mut(),
                 ranges: std::ptr::null_mut(),
                 lengths: std::ptr::null_mut(),
-                error: error_cstring("panic in mp3cutad_detect (caught)"),
+                error: error_cstring("panic in abrmad_detect (caught)"),
             });
             return Box::into_raw(result_box);
         }
@@ -209,7 +209,7 @@ pub unsafe extern "C" fn mp3cutad_detect(
 /// # Safety
 /// 此函数接收原始指针，调用者需确保指针有效
 #[no_mangle]
-pub unsafe extern "C" fn mp3cutad_cut(
+pub unsafe extern "C" fn abrmad_cut(
     input_file: *const c_char,
     output_file: *const c_char,
     ranges_ptr: *const CRange,
@@ -257,7 +257,7 @@ pub unsafe extern "C" fn mp3cutad_cut(
     match result {
         Ok(Ok(ptr)) => ptr,
         Ok(Err(e)) => error_cstring(format!("{}", e)),
-        Err(_) => error_cstring("panic in mp3cutad_cut (caught)"),
+        Err(_) => error_cstring("panic in abrmad_cut (caught)"),
     }
 }
 
@@ -266,7 +266,7 @@ pub unsafe extern "C" fn mp3cutad_cut(
 /// # Safety
 /// 此函数接收原始指针，调用者需确保指针有效
 #[no_mangle]
-pub unsafe extern "C" fn mp3cutad_free_result(result: *mut CDetectionResult) {
+pub unsafe extern "C" fn abrmad_free_result(result: *mut CDetectionResult) {
     if result.is_null() {
         return;
     }
@@ -295,7 +295,7 @@ pub unsafe extern "C" fn mp3cutad_free_result(result: *mut CDetectionResult) {
 /// # Safety
 /// 此函数接收原始指针，调用者需确保指针有效
 #[no_mangle]
-pub unsafe extern "C" fn mp3cutad_free_string(s: *mut c_char) {
+pub unsafe extern "C" fn abrmad_free_string(s: *mut c_char) {
     if !s.is_null() {
         let _ = CString::from_raw(s);
     }
@@ -303,7 +303,7 @@ pub unsafe extern "C" fn mp3cutad_free_string(s: *mut c_char) {
 
 /// 检查 FFmpeg 是否可用
 #[no_mangle]
-pub extern "C" fn mp3cutad_check_ffmpeg() -> c_int {
+pub extern "C" fn abrmad_check_ffmpeg() -> c_int {
     if ffmpeg::check_ffmpeg() {
         1
     } else {
@@ -313,7 +313,7 @@ pub extern "C" fn mp3cutad_check_ffmpeg() -> c_int {
 
 /// 获取版本信息
 #[no_mangle]
-pub extern "C" fn mp3cutad_version() -> *const c_char {
-    static VERSION: &str = concat!("mp3cutad-rs ", env!("CARGO_PKG_VERSION"), "\0");
+pub extern "C" fn abrmad_version() -> *const c_char {
+    static VERSION: &str = concat!("abrmad-rs ", env!("CARGO_PKG_VERSION"), "\0");
     VERSION.as_ptr() as *const c_char
 }

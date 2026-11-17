@@ -1,8 +1,8 @@
-# MP3CutAd-RS
+# ABRmAd-RS
 
 音频广告检测与裁剪工具。通过音频指纹匹配，找出多个音频文件中重复出现的片段（通常是广告），并自动裁剪掉这些片段。
 
-> **项目来源**：本项目参考 GitHub 上的同名项目 [licstar/MP3CutAd](https://github.com/licstar/MP3CutAd)（C# 实现），在其算法思路基础上使用 **Rust 重写**，并重新组织了代码结构、补充了图形界面和多格式支持。
+> **项目来源**：本项目参考 GitHub 上的开源项目 [licstar/MP3CutAd](https://github.com/licstar/MP3CutAd)（C# 实现），在其算法思路基础上使用 **Rust 重写**，并重新组织了代码结构、补充了图形界面和多格式支持。
 
 ## 功能特性
 
@@ -32,7 +32,7 @@
 检查 FFmpeg 是否可用：
 
 ```bash
-mp3cutad-cli check
+abrmad-cli check
 ```
 
 ## 构建
@@ -47,11 +47,11 @@ build.bat
 
 脚本依次构建库、CLI、GUI，并把产物复制到 `release\` 目录：
 
-- `release\MP3CutAd-RS.exe`（由 `mp3cutad-gui.exe` 复制并重命名，只保留这一个 GUI 文件）
-- `release\mp3cutad-cli.exe`
-- `release\mp3cutad_rs.dll`
+- `release\ABRmAd-RS.exe`（由 `abrmad-gui.exe` 复制并重命名，只保留这一个 GUI 文件）
+- `release\abrmad-cli.exe`
+- `release\abrmad_rs.dll`
 
-`release\` 不会再保留 `mp3cutad-gui.exe` 副本；需要原名时直接从 `target\release\` 取。
+`release\` 不会再保留 `abrmad-gui.exe` 副本；需要原名时直接从 `target\release\` 取。
 
 ### 方式二：手动构建
 
@@ -60,10 +60,10 @@ build.bat
 cargo build --release --lib
 
 # CLI（含 GPU 加速）
-cargo build --release --features cli,gpu --bin mp3cutad-cli
+cargo build --release --features cli,gpu --bin abrmad-cli
 
 # GUI（含 GPU 加速）
-cargo build --release --features gui,gpu --bin mp3cutad-gui
+cargo build --release --features gui,gpu --bin abrmad-gui
 
 # 一次性构建 CLI 与 GUI
 cargo build --release --features cli,gui,gpu
@@ -75,11 +75,11 @@ cargo build --release --features cli,gui,gpu
 
 | 文件 | 说明 |
 |---|---|
-| `mp3cutad-cli.exe` | 命令行程序 |
-| `mp3cutad-gui.exe` | 图形界面程序 |
-| `mp3cutad_rs.dll` | C ABI 动态库 |
+| `abrmad-cli.exe` | 命令行程序 |
+| `abrmad-gui.exe` | 图形界面程序 |
+| `abrmad_rs.dll` | C ABI 动态库 |
 
-分发时可将 `mp3cutad-gui.exe` 重命名为 `MP3CutAd-RS.exe`，或直接运行 `build.bat` 让它自动完成复制。三个文件均可单独拷出使用，但运行环境仍需安装 FFmpeg 并加入 `PATH`。
+分发时可将 `abrmad-gui.exe` 重命名为 `ABRmAd-RS.exe`，或直接运行 `build.bat` 让它自动完成复制。三个文件均可单独拷出使用，但运行环境仍需安装 FFmpeg 并加入 `PATH`。
 
 ### 开发与调试
 
@@ -90,9 +90,9 @@ cargo build --release --features cli,gui,gpu
 cargo build --features cli,gui
 
 # 直接运行（`--` 之后的参数传给程序本身）
-cargo run --features cli --bin mp3cutad-cli -- check
-cargo run --features cli --bin mp3cutad-cli -- detect a.mp3 b.mp3
-cargo run --features gui --bin mp3cutad-gui
+cargo run --features cli --bin abrmad-cli -- check
+cargo run --features cli --bin abrmad-cli -- detect a.mp3 b.mp3
+cargo run --features gui --bin abrmad-gui
 ```
 
 常用检查命令：
@@ -109,7 +109,7 @@ cargo test --lib viterbi -- --nocapture                # 只跑匹配的测试�
 GUI 通过 `env_logger` 初始化日志，需要排查问题时可打开调试日志：
 
 ```powershell
-$env:RUST_LOG="debug"; cargo run --features gui --bin mp3cutad-gui
+$env:RUST_LOG="debug"; cargo run --features gui --bin abrmad-gui
 ```
 
 ## GPU 加速
@@ -137,7 +137,7 @@ $env:RUST_LOG="debug"; cargo run --features gui --bin mp3cutad-gui
 
 ## 图形界面
 
-直接运行 `release\MP3CutAd-RS.exe`（开发构建可直接运行 `target\release\mp3cutad-gui.exe`）：
+直接运行 `release\ABRmAd-RS.exe`（开发构建可直接运行 `target\release\abrmad-gui.exe`）：
 
 1. **添加文件 / 添加目录**：支持上述 8 种音频格式
 2. **检测广告**：状态栏显示实时进度（预处理音频 i/N、比对音频片段 i/M）；勾选「HPSS 分离」会在预处理阶段先做谐波-打击乐分离，只对打击乐轨道检测，适合广告段混有背景音乐的素材
@@ -216,25 +216,25 @@ $env:RUST_LOG="debug"; cargo run --features gui --bin mp3cutad-gui
 ### 检测广告
 
 ```bash
-mp3cutad-cli detect file1.mp3 file2.flac -o result.txt
+abrmad-cli detect file1.mp3 file2.flac -o result.txt
 ```
 
 启用 HPSS 源分离（较慢，无缓存复用）：
 
 ```bash
-mp3cutad-cli detect --hpss file1.mp3 file2.flac -o result.txt
+abrmad-cli detect --hpss file1.mp3 file2.flac -o result.txt
 ```
 
 ### 裁剪（使用已有检测结果）
 
 ```bash
-mp3cutad-cli cut -i input_dir -o output_dir -r result.txt
+abrmad-cli cut -i input_dir -o output_dir -r result.txt
 ```
 
 ### 一键检测并裁剪
 
 ```bash
-mp3cutad-cli auto -i input_dir -o output_dir
+abrmad-cli auto -i input_dir -o output_dir
 ```
 
 ### 训练事件分类模型
@@ -250,7 +250,7 @@ mp3cutad-cli auto -i input_dir -o output_dir
 ```
 
 ```bash
-mp3cutad-cli train -d data.txt -o model.mcrf --trees 100 --max-depth 32 --test-split 0.2
+abrmad-cli train -d data.txt -o model.mcrf --trees 100 --max-depth 32 --test-split 0.2
 ```
 
 训练自动以 2 秒窗口、1 秒步长扩展样本，特征标准化后训练随机森林，并在留出的测试集上打印各标签的精确率、召回率与 F1。
@@ -258,7 +258,7 @@ mp3cutad-cli train -d data.txt -o model.mcrf --trees 100 --max-depth 32 --test-s
 ### 用模型分类音频
 
 ```bash
-mp3cutad-cli classify a.mp3 b.flac -m model.mcrf --confidence 0.55
+abrmad-cli classify a.mp3 b.flac -m model.mcrf --confidence 0.55
 ```
 
 输出每个文件的总帧数与检测到的事件区间（起止时间、标签、置信度）。`--window` / `--hop` 可覆盖模型内的窗口与步长（单位秒）。
@@ -266,21 +266,21 @@ mp3cutad-cli classify a.mp3 b.flac -m model.mcrf --confidence 0.55
 ### 参数说明
 
 ```
-mp3cutad-cli detect [OPTIONS] <FILES>...
+abrmad-cli detect [OPTIONS] <FILES>...
   <FILES>...                音频文件列表
   -o, --output <OUTPUT>     输出检测结果到文件
       --hpss                启用 HPSS 打击乐轨道源分离
 
-mp3cutad-cli cut [OPTIONS] -i <INPUT_DIR> -o <OUTPUT_DIR> -r <RESULT_FILE>
+abrmad-cli cut [OPTIONS] -i <INPUT_DIR> -o <OUTPUT_DIR> -r <RESULT_FILE>
   -i, --input-dir <DIR>     输入目录
   -o, --output-dir <DIR>    输出目录
   -r, --result-file <FILE>  检测结果文件
 
-mp3cutad-cli auto [OPTIONS] -i <INPUT_DIR> -o <OUTPUT_DIR>
+abrmad-cli auto [OPTIONS] -i <INPUT_DIR> -o <OUTPUT_DIR>
   -i, --input-dir <DIR>     输入目录
   -o, --output-dir <DIR>    输出目录
 
-mp3cutad-cli train [OPTIONS] -d <DATA_LIST> -o <OUTPUT>
+abrmad-cli train [OPTIONS] -d <DATA_LIST> -o <OUTPUT>
   -d, --data-list <FILE>    数据列表（每行 "路径 标签"）
   -o, --output <FILE>       输出的 .mcrf 模型文件
       --trees <N>           随机森林树数量，默认 100
@@ -288,7 +288,7 @@ mp3cutad-cli train [OPTIONS] -d <DATA_LIST> -o <OUTPUT>
       --test-split <R>      测试集比例，默认 0.2
       --seed <N>            随机种子，默认 42
 
-mp3cutad-cli classify [OPTIONS] <FILES>...
+abrmad-cli classify [OPTIONS] <FILES>...
   <FILES>...                音频文件列表
   -m, --model <FILE>        模型文件（必填）
   -w, --window <SEC>        覆盖窗口时长
@@ -384,7 +384,7 @@ mp3cutad-cli classify [OPTIONS] <FILES>...
 | FLAC | 无损重编码，保证时长元数据正确 |
 | OGG / OPUS / M4A / AAC / WMA | 重编码一次（流拷贝拼接易导致时间戳与时长错误） |
 
-**缓存**：检测中间结果（FFT 频谱图与 LSH 哈希）缓存在系统临时目录下的 `mp3cutad_rs`，以完整路径 + 文件修改时间校验，文件变更或缓存损坏会自动重算；解码产生的临时 WAV 在 FFT 计算完成后即删除。启用 HPSS 时结果与常规缓存不可混用，因此不读也不写 FFT/哈希缓存。删除整个缓存目录不影响使用，只是下次需要重新计算。
+**缓存**：检测中间结果（FFT 频谱图与 LSH 哈希）缓存在系统临时目录下的 `abrmad_rs`，以完整路径 + 文件修改时间校验，文件变更或缓存损坏会自动重算；解码产生的临时 WAV 在 FFT 计算完成后即删除。启用 HPSS 时结果与常规缓存不可混用，因此不读也不写 FFT/哈希缓存。删除整个缓存目录不影响使用，只是下次需要重新计算。
 
 ## 项目结构
 
@@ -460,16 +460,16 @@ docs/
 
 ## C ABI 接口
 
-`mp3cutad_rs.dll` 导出以下函数（`ffi.rs`）：
+`abrmad_rs.dll` 导出以下函数（`ffi.rs`）：
 
 | 函数 | 签名说明 |
 |---|---|
-| `mp3cutad_detect` | `(files_ptr, files_count, progress_cb, user_data) -> *mut CDetectionResult`，检测广告 |
-| `mp3cutad_cut` | `(input, output, ranges_ptr, ranges_count, total_length) -> *mut c_char`，按检测结果裁剪 |
-| `mp3cutad_free_result` | 释放检测结果 |
-| `mp3cutad_free_string` | 释放返回的字符串 |
-| `mp3cutad_check_ffmpeg` | 检查 FFmpeg 是否可用 |
-| `mp3cutad_version` | 返回版本字符串 |
+| `abrmad_detect` | `(files_ptr, files_count, progress_cb, user_data) -> *mut CDetectionResult`，检测广告 |
+| `abrmad_cut` | `(input, output, ranges_ptr, ranges_count, total_length) -> *mut c_char`，按检测结果裁剪 |
+| `abrmad_free_result` | 释放检测结果 |
+| `abrmad_free_string` | 释放返回的字符串 |
+| `abrmad_check_ffmpeg` | 检查 FFmpeg 是否可用 |
+| `abrmad_version` | 返回版本字符串 |
 
 ## 已实现的优化
 

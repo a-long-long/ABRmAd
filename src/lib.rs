@@ -1,4 +1,4 @@
-//! MP3CutAd Rust 核心库
+//! ABRmAd Rust 核心库
 //!
 //! 提供音频广告检测和裁剪功能。代码分层：
 //! - [`core`]: 纯算法（频谱、LSH、特征、Viterbi、检测）

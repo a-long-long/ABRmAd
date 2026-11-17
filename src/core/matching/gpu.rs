@@ -86,7 +86,7 @@ mod imp {
         limits.max_storage_buffers_per_shader_stage = 8;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
-                label: Some("mp3cutad-gpu"),
+                label: Some("abrmad-gpu"),
                 required_features: wgpu::Features::empty(),
                 required_limits: limits,
                 ..Default::default()

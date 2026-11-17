@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn save_load_roundtrip_keeps_paths() {
         let dir = std::env::temp_dir().join(format!(
-            "mp3cutad_result_test_{}_{}",
+            "abrmad_result_test_{}_{}",
             std::process::id(),
             rand::random::<u32>()
         ));

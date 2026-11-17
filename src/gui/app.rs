@@ -6,12 +6,12 @@ use super::state::SharedState;
 use super::{fonts, panels, status_bar, sysmon, toolbar};
 
 /// 主应用
-struct Mp3CutAdApp {
+struct AbRmAdApp {
     state: SharedState,
     monitor: sysmon::SysMonitor,
 }
 
-impl Mp3CutAdApp {
+impl AbRmAdApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::light());
         Self {
@@ -21,7 +21,7 @@ impl Mp3CutAdApp {
     }
 }
 
-impl eframe::App for Mp3CutAdApp {
+impl eframe::App for AbRmAdApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.monitor.sample();
         toolbar::menu_bar(ctx, &self.state);
@@ -64,7 +64,7 @@ pub fn run() -> eframe::Result<()> {
             .with_inner_size([1000.0, 600.0])
             .with_min_inner_size([800.0, 400.0])
             .with_icon(std::sync::Arc::new(icon))
-            .with_title("MP3CutAd-RS - MP3 广告检测与裁剪"),
+            .with_title("ABRmAd-RS - MP3 广告检测与裁剪"),
         // 强制使用 OpenGL/Glow 渲染后端：
         // 默认 wgpu 优先走 Vulkan，在缺少 Vulkan 驱动的环境（如部分 ARM/虚拟显示）
         // 会初始化卡死；Glow 直接走 OpenGL，兼容性更好。
@@ -73,11 +73,11 @@ pub fn run() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "MP3CutAd-RS",
+        "ABRmAd-RS",
         options,
         Box::new(|cc| {
             fonts::setup_chinese_font(&cc.egui_ctx);
-            Ok(Box::new(Mp3CutAdApp::new(cc)))
+            Ok(Box::new(AbRmAdApp::new(cc)))
         }),
     )
 }

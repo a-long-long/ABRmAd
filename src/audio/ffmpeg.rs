@@ -43,7 +43,7 @@ where
 
 /// 确保输出文件的父目录存在。
 ///
-/// ffmpeg 不会自动创建输出路径中的目录，缓存目录（如 `/tmp/mp3cutad_rs`）
+/// ffmpeg 不会自动创建输出路径中的目录，缓存目录（如 `/tmp/abrmad_rs`）
 /// 首次不存在时会直接导致 `No such file or directory`，因此写文件前先建目录。
 fn ensure_parent_dir(output: &Path) -> Result<()> {
     if let Some(parent) = output.parent() {
