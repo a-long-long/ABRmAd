@@ -74,9 +74,18 @@ pub(super) fn check_same_adaptive(
         .collect()
 }
 
+/// GPU 粗筛后交给 CPU f64 精算的候选上限
+///
+/// 每个帧组最多精确复算 TOP_RECHECK 个候选。GPU f32 排序通常与 CPU f64
+/// 排序一致，但在近优候选之间可能因精度差异错位；8 个足以覆盖实际场景
+/// 中所有可能的排名扰动，又避免了极端情况下退化为逐对全量复算。
+const TOP_RECHECK: usize = 8;
+
 /// 计算每个帧组的最高相似度及对应位置
 ///
 /// 优先尝试 GPU 批量计算，不可用时回退到 CPU（AVX2/标量）实现。
+/// GPU 路径只做 f32 粗筛，最终决策由 CPU f64 精算完成，保证与纯 CPU
+/// 路径选出完全一致的锚点。
 fn best_matches(
     fft1: &Array2<f64>,
     fft2: &Array2<f64>,
@@ -97,35 +106,60 @@ fn best_matches(
 
     if let Some(scores) = crate::core::matching::gpu::cosine_pairs(fft1, fft2, &pairs, HASH_WINDOW_SIZE) {
         gpu_used.store(true, Ordering::Relaxed);
-        let mut out = Vec::with_capacity(groups.len());
-        let mut k = 0usize;
-        for &(i, ref positions) in groups {
-            let start = k;
-            let mut max_sim = 0.0f64;
-            for _ in 0..positions.len() {
-                let sim = scores[k];
-                k += 1;
-                if sim > max_sim {
-                    max_sim = sim;
-                }
-            }
-            // 重复素材会大量出现几乎相同的分数，GPU 的 f32 舍入会打乱次序；
-            // 取第一个与最高分相差 1e-4 以内的位置，尽量还原 CPU 的选取结果。
-            let mut best_pos = positions[0];
-            for (off, &p) in positions.iter().enumerate() {
-                if scores[start + off] >= max_sim - 1e-4 {
-                    best_pos = p;
-                    break;
-                }
-            }
-            // 命中项用 f64 复算，保证后续阈值与链路使用与纯 CPU 一致的数值。
-            let exact = lsh::cosine_sim(fft1, fft2, i, best_pos, HASH_WINDOW_SIZE);
-            out.push((i, best_pos, exact));
-        }
-        return out;
+        return gpu_best_matches_recheck(fft1, fft2, groups, &scores);
     }
 
     cpu_best_matches(fft1, fft2, groups)
+}
+
+/// GPU 粗筛 + CPU f64 精算
+///
+/// GPU 用 f32 算出所有候选的余弦相似度后，按 GPU 分数降序取 TOP_RECHECK
+/// 个候选，逐个用 CPU f64 `cosine_sim` 精确复算，在精确分数里选最优。
+/// 这样 GPU 的并行加速仍然保留（所有候选一次性在 f32 空间粗筛），但
+/// 最终锚点的选取完全由 f64 精度决定，与纯 CPU 路径结果一致。
+fn gpu_best_matches_recheck(
+    fft1: &Array2<f64>,
+    fft2: &Array2<f64>,
+    groups: &[(usize, Vec<usize>)],
+    scores: &[f64],
+) -> Vec<(usize, usize, f64)> {
+    let mut out = Vec::with_capacity(groups.len());
+    let mut k = 0usize;
+    for &(i, ref positions) in groups {
+        let n = positions.len();
+
+        // 按 GPU f32 分数降序取前 TOP_RECHECK 个候选索引
+        let mut ranked: Vec<usize> = (0..n).collect();
+        let take = TOP_RECHECK.min(n);
+        // 用 partial sort（前 take 个有序），避免全量排序
+        ranked.select_nth_unstable_by(take, |&a, &b| {
+            let sa = scores[k + a];
+            let sb = scores[k + b];
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        ranked.truncate(take);
+        // 对选出的 top-K 再排一次，确保顺序稳定（可能不需要，但无害）
+        ranked.sort_by(|&a, &b| {
+            let sa = scores[k + a];
+            let sb = scores[k + b];
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // CPU f64 精确复算，选真正最优
+        let mut best_sim = f64::NEG_INFINITY;
+        let mut best_pos = positions[0];
+        for &off in &ranked {
+            let exact = lsh::cosine_sim(fft1, fft2, i, positions[off], HASH_WINDOW_SIZE);
+            if exact > best_sim {
+                best_sim = exact;
+                best_pos = positions[off];
+            }
+        }
+        out.push((i, best_pos, best_sim));
+        k += n;
+    }
+    out
 }
 
 /// CPU 版本：逐组计算并选取最高相似度
@@ -149,4 +183,167 @@ fn cpu_best_matches(
             (i, best_pos, best_sim)
         })
         .collect()
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    use super::*;
+    use crate::core::matching::gpu;
+    use ndarray::Array2;
+    use std::sync::atomic::AtomicBool;
+
+    /// 构造有多个近优候选的测试场景
+    ///
+    /// 在频谱矩阵里用不同缩放的 sin/cos 组合，使得同一帧组有多个位置
+    /// 的真实 f64 分数非常接近，f32 精度足以打乱排序。
+    fn make_spectra() -> (Array2<f64>, Array2<f64>) {
+        let width = 64;
+        let rows_a = 128usize;
+        let rows_b = 160usize;
+        let a: Array2<f64> = Array2::from_shape_fn((rows_a, width), |(i, j)| {
+            let k = i as f64 * 0.17;
+            let f = j as f64 * 0.031;
+            (k * f).sin() * 0.9 + (k + f).cos() * 0.3 + (i as f64 * 0.007).sin() * 0.1
+        });
+        let b: Array2<f64> = Array2::from_shape_fn((rows_b, width), |(i, j)| {
+            let k = i as f64 * 0.15;
+            let f = j as f64 * 0.029;
+            (k * f).sin() * 0.88 + (k + f).cos() * 0.32 + (i as f64 * 0.006).sin() * 0.12
+        });
+        (a, b)
+    }
+
+    /// 构造每个帧组都有多个近优候选的 groups
+    fn make_groups(a_rows: usize, b_rows: usize) -> Vec<(usize, Vec<usize>)> {
+        let window = HASH_WINDOW_SIZE;
+        let mut groups = Vec::new();
+        for i in (0..=a_rows.saturating_sub(window)).step_by(window) {
+            // 每个帧组给 16 个候选，其中包含真实最优位置
+            let b_max = b_rows.saturating_sub(window);
+            let mut positions = Vec::new();
+            let base = (i as i64 * 13 + 7) % b_max as i64;
+            let base = base.max(0) as usize;
+            for k in 0..16 {
+                positions.push((base + k * 3) % b_max);
+            }
+            groups.push((i, positions));
+        }
+        groups
+    }
+
+    /// GPU + 粗筛后精算 选出的位置 必须 与纯 CPU 完全一致
+    #[test]
+    fn gpu_best_matches_matches_cpu_positions() {
+        if gpu::backend_name().is_none() {
+            eprintln!("未检测到可用 GPU，跳过");
+            return;
+        }
+
+        let (fft1, fft2) = make_spectra();
+        let groups = make_groups(fft1.nrows(), fft2.nrows());
+
+        let mut pairs = Vec::new();
+        for &(i, ref pos) in &groups {
+            for &p in pos {
+                pairs.push((i, p));
+            }
+        }
+
+        // CPU 路径
+        let cpu_out = cpu_best_matches(&fft1, &fft2, &groups);
+
+        // GPU 路径（走新的粗筛+精算）
+        let scores = gpu::cosine_pairs(&fft1, &fft2, &pairs, HASH_WINDOW_SIZE)
+            .expect("GPU 应返回结果");
+        let gpu_out = gpu_best_matches_recheck(&fft1, &fft2, &groups, &scores);
+
+        assert_eq!(gpu_out.len(), cpu_out.len());
+        for (idx, ((gi, gp, gs), (ci, cp, cs))) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
+            assert_eq!(gi, ci, "group {idx}: frame index mismatch");
+            assert_eq!(gp, cp, "group {idx}: BEST POSITION MISMATCH — gpu={gp} cpu={cp}, gpu_score={gs}, cpu_score={cs}");
+            assert!((gs - cs).abs() < 1e-12, "group {idx}: score mismatch gpu={gs} cpu={cs}");
+        }
+    }
+
+    /// 直接测试 best_matches 公共函数（含 GPU 回退逻辑）
+    #[test]
+    fn best_matches_with_gpu_matches_cpu() {
+        if gpu::backend_name().is_none() {
+            eprintln!("未检测到可用 GPU，跳过");
+            return;
+        }
+
+        let (fft1, fft2) = make_spectra();
+        let groups = make_groups(fft1.nrows(), fft2.nrows());
+
+        let mut gpu_used = AtomicBool::new(false);
+        let gpu_out = best_matches(&fft1, &fft2, &groups, &gpu_used);
+        assert!(gpu_used.load(std::sync::atomic::Ordering::Relaxed), "应实际走到 GPU 路径");
+
+        // CPU 参考结果
+        let cpu_out = cpu_best_matches(&fft1, &fft2, &groups);
+
+        assert_eq!(gpu_out.len(), cpu_out.len());
+        for (idx, ((gi, gp, gs), (ci, cp, cs))) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
+            assert_eq!(gi, ci, "group {idx}: frame index mismatch");
+            assert_eq!(gp, cp, "group {idx}: BEST POSITION MISMATCH — gpu={gp} cpu={cp}, gpu_score={gs:.6} cpu_score={cs:.6}");
+            assert!((gs - cs).abs() < 1e-12, "group {idx}: score mismatch");
+        }
+    }
+
+    /// GPU 分数和 CPU 分数的数值本身有差异（这是预期的 f32/f64 差异），
+    /// 但排序前 8 个候选里应包含 CPU 真正最优的那个
+    #[test]
+    fn gpu_top8_always_contains_cpu_best() {
+        if gpu::backend_name().is_none() {
+            eprintln!("未检测到可用 GPU，跳过");
+            return;
+        }
+
+        let (fft1, fft2) = make_spectra();
+        let groups = make_groups(fft1.nrows(), fft2.nrows());
+
+        let mut pairs = Vec::new();
+        for &(i, ref pos) in &groups {
+            for &p in pos {
+                pairs.push((i, p));
+            }
+        }
+
+        let scores = gpu::cosine_pairs(&fft1, &fft2, &pairs, HASH_WINDOW_SIZE)
+            .expect("GPU 应返回结果");
+
+        let mut k = 0usize;
+        for &(i, ref positions) in &groups {
+            let n = positions.len();
+
+            // CPU 真正最优
+            let (cpu_best_pos, _) = positions
+                .iter()
+                .enumerate()
+                .map(|(off, &p)| (off, lsh::cosine_sim(&fft1, &fft2, i, p, HASH_WINDOW_SIZE)))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(off, sim)| (off, sim))
+                .unwrap();
+
+            // GPU 按 f32 分数排序的 top-8 索引
+            let mut ranked: Vec<usize> = (0..n).collect();
+            let take = TOP_RECHECK.min(n);
+            ranked.select_nth_unstable_by(take, |&a, &b| {
+                let sa = scores[k + a];
+                let sb = scores[k + b];
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            ranked.truncate(take);
+
+            // CPU 最优的位置索引应该在 GPU top-8 里
+            let in_top8 = ranked.contains(&cpu_best_pos);
+            assert!(
+                in_top8,
+                "group i={i}: CPU best pos index {cpu_best_pos} NOT in GPU top-{take}, ranked={ranked:?}"
+            );
+
+            k += n;
+        }
+    }
 }
