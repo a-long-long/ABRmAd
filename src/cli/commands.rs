@@ -171,7 +171,11 @@ fn cmd_detect(files: &[PathBuf], output: Option<&PathBuf>, hpss: bool) -> Result
     }
 
     for (i, (ranges, len)) in result.ranges.iter().zip(result.lengths.iter()).enumerate() {
-        let file_name = files[i].file_name().unwrap().to_string_lossy();
+        // 路径以 ".." 结尾时 file_name() 为 None，回退到完整路径，避免 panic
+        let file_name = files[i]
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_else(|| files[i].display().to_string().into());
         println!("\n文件: {}", file_name);
         println!("  总帧数: {}", len);
         println!("  检测到 {} 个广告区间:", ranges.len());
@@ -258,7 +262,10 @@ fn cmd_auto(input_dir: &Path, output_dir: &Path) -> Result<()> {
 
     println!("\n处理统计:");
     for (i, ranges) in result.ranges.iter().enumerate() {
-        let file_name = audio_files[i].file_name().unwrap().to_string_lossy();
+        let file_name = audio_files[i]
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_else(|| audio_files[i].display().to_string().into());
         let ad_duration: i32 = ranges
             .iter()
             .filter(|r| r.count > 1)
@@ -398,7 +405,10 @@ fn cmd_classify(
         if !f.exists() {
             bail!("文件不存在: {}", f.display());
         }
-        let name = f.file_name().unwrap().to_string_lossy();
+        let name = f
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_else(|| f.display().to_string().into());
         println!("\n文件: {}", name);
         let (events, n_frames) = classify_file_with_progress(f, &model, &opts, |_, _| {})?;
         println!("  总帧数: {} ({}秒)", n_frames, n_frames as f64 / 10.0);
