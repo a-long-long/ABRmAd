@@ -46,8 +46,7 @@ pub(crate) fn draw_file_track(
     label_colors: &HashMap<String, egui::Color32>,
 ) {
     let file_len = file.length as f32;
-    let effective_ads: Vec<&crate::core::range::Range> =
-        file.effective_ads(thresholds).collect();
+    let effective_ads: Vec<&crate::core::range::Range> = file.effective_ads(thresholds).collect();
     let event_ranges = &file.event_ranges;
 
     // 剩余时长按实际会被裁剪的段（已标记删除）计算，与保存结果保持一致
@@ -65,17 +64,24 @@ pub(crate) fn draw_file_track(
 
     ui.horizontal(|ui| {
         // 状态图标
-        let icon = if file.detected && file.classified { "⚡" }
-            else if file.detected { "✓" }
-            else if file.classified { "🎯" }
-            else { "○" };
+        let icon = if file.detected && file.classified {
+            "⚡"
+        } else if file.detected {
+            "✓"
+        } else if file.classified {
+            "🎯"
+        } else {
+            "○"
+        };
         ui.label(icon);
         ui.strong(&file.name);
 
-        let orig_dur = if file.length > 0 { file.length as f64 / 10.0 } else { 0.0 };
-        let mut summary = format!(
-            "  原始: {:.1}s", orig_dur
-        );
+        let orig_dur = if file.length > 0 {
+            file.length as f64 / 10.0
+        } else {
+            0.0
+        };
+        let mut summary = format!("  原始: {:.1}s", orig_dur);
         if !effective_ads.is_empty() {
             summary.push_str(&format!(
                 " | 剩余: {:.1}s | {} 广告段（已标记删除 {}）",
@@ -247,14 +253,17 @@ fn draw_event_track(
     label_colors: &HashMap<String, egui::Color32>,
 ) {
     let bar_width = ui.available_width();
-    let (resp, painter) =
-        ui.allocate_painter(egui::vec2(bar_width, EVENT_TRACK_HEIGHT), egui::Sense::hover());
+    let (resp, painter) = ui.allocate_painter(
+        egui::vec2(bar_width, EVENT_TRACK_HEIGHT),
+        egui::Sense::hover(),
+    );
     let event_rect = resp.rect;
 
     // 事件轨道背景（比主条浅）
     painter.rect_filled(event_rect, 2.0, egui::Color32::from_rgb(22, 26, 32));
     painter.rect_stroke(
-        event_rect, 2.0,
+        event_rect,
+        2.0,
         egui::Stroke::new(0.5_f32, egui::Color32::from_rgb(50, 55, 60)),
     );
 
@@ -275,18 +284,12 @@ fn draw_event_track(
         // 填充（低 alpha）+ 边框（高 alpha）
         let fill = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 50);
         painter.rect_filled(seg_rect, 2.0, fill);
-        painter.rect_stroke(
-            seg_rect, 2.0,
-            egui::Stroke::new(1.5_f32, color),
-        );
+        painter.rect_stroke(seg_rect, 2.0, egui::Stroke::new(1.5_f32, color));
 
         // 标签文字 + 置信度（段够宽才显示）
         let seg_width = x1 - x0;
         if seg_width > 60.0 {
-            let label_text = format!(
-                "{} {:.0}%",
-                ev.label, ev.confidence * 100.0
-            );
+            let label_text = format!("{} {:.0}%", ev.label, ev.confidence * 100.0);
             painter.text(
                 egui::pos2((x0 + x1) / 2.0, seg_rect.center().y),
                 egui::Align2::CENTER_CENTER,

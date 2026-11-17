@@ -5,9 +5,9 @@
 use libc;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::slice;
-use std::panic::AssertUnwindSafe;
 
 use crate::audio::ffmpeg;
 use crate::core::detect;
@@ -16,7 +16,9 @@ use crate::pipeline;
 
 /// 构造错误 C 字符串（统一入口，避免 unwrap panic）
 fn error_cstring(msg: impl Into<String>) -> *mut c_char {
-    CString::new(msg.into()).unwrap_or_else(|_| CString::new("internal error").unwrap()).into_raw()
+    CString::new(msg.into())
+        .unwrap_or_else(|_| CString::new("internal error").unwrap())
+        .into_raw()
 }
 
 /// 检测结果结构（C 兼容）
@@ -133,7 +135,8 @@ pub unsafe extern "C" fn abrmad_detect(
     let file_count = det_result.ranges.len() as c_int;
 
     // malloc 判空：分配失败直接返回错误结果
-    let range_counts = libc::malloc(file_count as usize * std::mem::size_of::<c_int>()) as *mut c_int;
+    let range_counts =
+        libc::malloc(file_count as usize * std::mem::size_of::<c_int>()) as *mut c_int;
     if file_count > 0 && range_counts.is_null() {
         let result_box = Box::new(CDetectionResult {
             file_count: 0,

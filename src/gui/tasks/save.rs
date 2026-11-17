@@ -1,7 +1,7 @@
 //! 保存（按广告区间裁剪写盘）流程
 
 use std::collections::HashSet;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
@@ -196,7 +196,10 @@ mod tests {
         let dir = Path::new("out");
         let mut used = HashSet::new();
 
-        assert_eq!(unique_output_path(dir, "a.mp3", &mut used), dir.join("a.mp3"));
+        assert_eq!(
+            unique_output_path(dir, "a.mp3", &mut used),
+            dir.join("a.mp3")
+        );
         assert_eq!(
             unique_output_path(dir, "a.mp3", &mut used),
             dir.join("a (1).mp3")

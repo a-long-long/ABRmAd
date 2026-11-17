@@ -201,8 +201,7 @@ fn run_training(
                 path.display()
             ));
             s.model_path = Some(path.clone());
-            s.status_message =
-                format!("训练完成: {}（{} 个窗口）", path.display(), report.samples);
+            s.status_message = format!("训练完成: {}（{} 个窗口）", path.display(), report.samples);
         }
         Err(e) => {
             let mut s = state.lock().unwrap();

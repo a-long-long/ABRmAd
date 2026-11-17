@@ -68,14 +68,14 @@ pub(crate) fn confidence_legend(ui: &mut egui::Ui, thresholds: crate::gui::state
 
 pub(crate) fn event_palette() -> Vec<egui::Color32> {
     vec![
-        egui::Color32::from_rgb(100, 200, 255),  // 浅蓝
-        egui::Color32::from_rgb(150, 255, 150),  // 浅绿
-        egui::Color32::from_rgb(255, 180, 100),  // 橙黄
-        egui::Color32::from_rgb(200, 150, 255),  // 淡紫
-        egui::Color32::from_rgb(100, 255, 220),  // 青
-        egui::Color32::from_rgb(255, 140, 180),  // 粉红
-        egui::Color32::from_rgb(255, 230, 100),  // 亮黄
-        egui::Color32::from_rgb(140, 200, 140),  // 苔绿
+        egui::Color32::from_rgb(100, 200, 255), // 浅蓝
+        egui::Color32::from_rgb(150, 255, 150), // 浅绿
+        egui::Color32::from_rgb(255, 180, 100), // 橙黄
+        egui::Color32::from_rgb(200, 150, 255), // 淡紫
+        egui::Color32::from_rgb(100, 255, 220), // 青
+        egui::Color32::from_rgb(255, 140, 180), // 粉红
+        egui::Color32::from_rgb(255, 230, 100), // 亮黄
+        egui::Color32::from_rgb(140, 200, 140), // 苔绿
     ]
 }
 

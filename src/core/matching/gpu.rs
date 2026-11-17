@@ -59,7 +59,10 @@ mod imp {
     fn backend() -> Option<&'static Backend> {
         BACKEND
             .get_or_init(|| {
-                if std::env::var("MP3CUTAD_NO_GPU").map(|v| v == "1").unwrap_or(false) {
+                if std::env::var("MP3CUTAD_NO_GPU")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                {
                     return None;
                 }
                 init_backend()
@@ -150,7 +153,9 @@ mod imp {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: !read_write },
+                ty: wgpu::BufferBindingType::Storage {
+                    read_only: !read_write,
+                },
                 has_dynamic_offset: false,
                 min_binding_size: None,
             },
@@ -204,7 +209,9 @@ mod imp {
         let backend = backend()?;
         let mut out = Vec::with_capacity(pairs.len());
         for chunk in pairs.chunks(MAX_PAIRS_PER_BATCH) {
-            let scores = run_batch(backend, &a_data, &b_data, &norms_a, &norms_b, chunk, size, width)?;
+            let scores = run_batch(
+                backend, &a_data, &b_data, &norms_a, &norms_b, chunk, size, width,
+            )?;
             out.extend(scores);
         }
         Some(out)
@@ -402,10 +409,12 @@ mod tests {
 
         let size = 8;
         let width = 32;
-        let a: Array2<f64> =
-            Array2::from_shape_fn((64, width), |(i, j)| ((i * 7 + j * 13) as f64 * 0.017).sin());
-        let b: Array2<f64> =
-            Array2::from_shape_fn((64, width), |(i, j)| ((i * 5 + j * 11) as f64 * 0.023).cos());
+        let a: Array2<f64> = Array2::from_shape_fn((64, width), |(i, j)| {
+            ((i * 7 + j * 13) as f64 * 0.017).sin()
+        });
+        let b: Array2<f64> = Array2::from_shape_fn((64, width), |(i, j)| {
+            ((i * 5 + j * 11) as f64 * 0.023).cos()
+        });
 
         // 构造足够多的配对以触发 GPU 路径
         let mut pairs = Vec::with_capacity(4096);

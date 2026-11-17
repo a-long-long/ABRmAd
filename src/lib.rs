@@ -24,8 +24,8 @@ pub mod gui;
 
 // 重新导出主要接口
 pub use audio::ffmpeg::{audio_to_wav, cut_and_combine};
+pub use core::classify::model::ModelFile;
 pub use core::classify::{ClassifyOptions, EventRange};
 pub use core::detect::{detect_ad, reverse_range, DetectionResult};
-pub use core::classify::model::ModelFile;
 pub use core::range::Range;
 pub use pipeline::{collect_audio_files, cut_file, is_supported_audio, keep_segments};

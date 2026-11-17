@@ -75,11 +75,7 @@ pub fn load_with_paths(path: &Path) -> Result<(Vec<PathBuf>, DetectionResult)> {
         .context("结果文件头不是有效的文件数量")?;
 
     if num_files > MAX_FILES {
-        bail!(
-            "结果文件声明的文件数 {} 超过上限 {}",
-            num_files,
-            MAX_FILES
-        );
+        bail!("结果文件声明的文件数 {} 超过上限 {}", num_files, MAX_FILES);
     }
 
     let mut paths = Vec::with_capacity(num_files);
@@ -122,10 +118,7 @@ pub fn load_with_paths(path: &Path) -> Result<(Vec<PathBuf>, DetectionResult)> {
                 end: parts[1].parse().context("区间结束位置无效")?,
                 count: parts[2].parse().context("区间出现次数无效")?,
                 type_id: parts[3].parse().context("区间类型无效")?,
-                score: parts
-                    .get(4)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.0),
+                score: parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0.0),
             });
         }
 

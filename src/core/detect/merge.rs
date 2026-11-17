@@ -189,7 +189,10 @@ mod tests {
     fn reverse_range_keeps_count_one_segments() {
         // count=1 的段在 GUI 最小次数为 1 时同样应参与补集计算
         let ranges = vec![Range::new(100, 200, 1)];
-        assert_eq!(segments(&reverse_range(&ranges, 1000)), vec![(0, 100), (200, 1000)]);
+        assert_eq!(
+            segments(&reverse_range(&ranges, 1000)),
+            vec![(0, 100), (200, 1000)]
+        );
     }
 
     #[test]
@@ -200,7 +203,10 @@ mod tests {
             Range::new(350, 500, 2),
         ];
         // 重叠/相接的段合并为 100-500 后求补集，不产生负长度区间
-        assert_eq!(segments(&reverse_range(&ranges, 1000)), vec![(0, 100), (500, 1000)]);
+        assert_eq!(
+            segments(&reverse_range(&ranges, 1000)),
+            vec![(0, 100), (500, 1000)]
+        );
     }
 
     #[test]

@@ -44,8 +44,13 @@ pub struct DetectOptions {
 }
 
 impl DetectOptions {
-    pub fn new() -> Self { Self::default() }
-    pub fn with_hpss(mut self) -> Self { self.enable_hpss = true; self }
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_hpss(mut self) -> Self {
+        self.enable_hpss = true;
+        self
+    }
 }
 
 /// 哈希窗口大小（帧数）
@@ -265,7 +270,10 @@ where
     let lengths: Vec<usize> = ffts.iter().map(|f| f.nrows()).collect();
 
     if !failed.is_empty() {
-        eprintln!("警告：{} 个文件预处理失败，已跳过（不影响其余文件）：", failed.len());
+        eprintln!(
+            "警告：{} 个文件预处理失败，已跳过（不影响其余文件）：",
+            failed.len()
+        );
         for f in &failed {
             eprintln!("  - {}", f);
         }

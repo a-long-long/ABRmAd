@@ -116,8 +116,7 @@ fn draw_textured(
     for r in file.effective_ads(thresholds) {
         let x0 = rect.left() + rect.width() * r.begin as f32 / total;
         let x1 = rect.left() + rect.width() * r.end as f32 / total;
-        let ad_rect =
-            egui::Rect::from_x_y_ranges(x0..=x1, rect.top()..=rect.bottom());
+        let ad_rect = egui::Rect::from_x_y_ranges(x0..=x1, rect.top()..=rect.bottom());
         painter.rect_filled(
             ad_rect,
             0.0,
@@ -226,13 +225,13 @@ fn heat(level: f32) -> Color32 {
         let (t0, c0) = pair[0];
         let (t1, c1) = pair[1];
         if level <= t1 {
-            let k = if t1 > t0 { (level - t0) / (t1 - t0) } else { 0.0 };
+            let k = if t1 > t0 {
+                (level - t0) / (t1 - t0)
+            } else {
+                0.0
+            };
             let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * k).round() as u8;
-            return Color32::from_rgb(
-                mix(c0.0, c1.0),
-                mix(c0.1, c1.1),
-                mix(c0.2, c1.2),
-            );
+            return Color32::from_rgb(mix(c0.0, c1.0), mix(c0.1, c1.1), mix(c0.2, c1.2));
         }
     }
 

@@ -227,7 +227,9 @@ where
     on_progress(1.0, "训练随机森林...");
     let params = ForestParams {
         n_trees: config.n_trees.max(1),
-        max_depth: config.max_depth.clamp(1, crate::core::classify::forest::MAX_DEPTH_CAP),
+        max_depth: config
+            .max_depth
+            .clamp(1, crate::core::classify::forest::MAX_DEPTH_CAP),
         ..Default::default()
     };
     let forest = Forest::train(&train_x, &train_y, &params, config.seed, Some(labels.len()));

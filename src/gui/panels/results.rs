@@ -48,10 +48,7 @@ pub fn show(ctx: &Context, state: &SharedState) {
             .iter()
             .map(|(_, f)| f.effective_ad_count(thresholds))
             .sum();
-        let events_total: usize = all_files
-            .iter()
-            .map(|(_, f)| f.event_ranges.len())
-            .sum();
+        let events_total: usize = all_files.iter().map(|(_, f)| f.event_ranges.len()).sum();
 
         // 事件标签颜色由全局排序后的标签顺序决定，保证轨道与图例颜色一致
         let all_labels: Vec<String> = {
@@ -74,16 +71,16 @@ pub fn show(ctx: &Context, state: &SharedState) {
             let label = match (ads_total > 0, events_total > 0) {
                 (true, true) => format!(
                     "检测结果 ({} 文件, {} 广告段, {} 事件)",
-                    all_files.len(), ads_total, events_total
+                    all_files.len(),
+                    ads_total,
+                    events_total
                 ),
-                (true, false) => format!(
-                    "检测结果 ({} 文件, {} 广告段)",
-                    all_files.len(), ads_total
-                ),
-                (false, true) => format!(
-                    "分类结果 ({} 文件, {} 事件)",
-                    all_files.len(), events_total
-                ),
+                (true, false) => {
+                    format!("检测结果 ({} 文件, {} 广告段)", all_files.len(), ads_total)
+                }
+                (false, true) => {
+                    format!("分类结果 ({} 文件, {} 事件)", all_files.len(), events_total)
+                }
                 _ => format!("结果 ({} 文件)", all_files.len()),
             };
             ui.heading(label);
@@ -187,4 +184,3 @@ fn toggle_selection(state: &SharedState, file_idx: usize, ad_idx: usize) {
         s.status_message = format!("已选择广告段 {} (共 {} 个)", ad_idx + 1, count);
     }
 }
-

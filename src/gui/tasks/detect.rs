@@ -1,6 +1,6 @@
 //! 文件添加与广告检测任务
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::thread;
 
 use crate::core::detect::{detect_ad_with_progress, DetectOptions};
@@ -180,7 +180,10 @@ pub(crate) fn mark_selected_for_deletion(state: &SharedState) {
         .files
         .iter()
         .filter(|f| f.detected)
-        .map(|f| f.effective_ad_count(th).saturating_sub(f.marked_for_deletion.len()))
+        .map(|f| {
+            f.effective_ad_count(th)
+                .saturating_sub(f.marked_for_deletion.len())
+        })
         .sum();
 
     s.status_message = format!(

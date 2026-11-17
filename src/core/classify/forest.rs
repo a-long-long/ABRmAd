@@ -1,4 +1,3 @@
-
 use ndarray::Array2;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -65,32 +64,74 @@ impl Forest {
     ///
     /// `n_classes` 可取 Some(全量标签数) 或 None 自动从 y 的最大标签推断。
     /// 显式指定时避免"某些标签仅在测试集导致 n_classes 偏小"的问题。
-    pub fn train(x: &Array2<f64>, y: &[usize], params: &ForestParams, seed: u64, n_classes: Option<usize>) -> Self {
+    pub fn train(
+        x: &Array2<f64>,
+        y: &[usize],
+        params: &ForestParams,
+        seed: u64,
+        n_classes: Option<usize>,
+    ) -> Self {
         let n_samples = x.nrows();
         let dim = x.ncols();
-        let nc = n_classes.unwrap_or_else(|| y.iter().max().copied().unwrap_or(0) + 1).max(1);
-        let mf = if params.max_features == 0 { (dim as f64).sqrt() as usize } else { params.max_features.min(dim) };
+        let nc = n_classes
+            .unwrap_or_else(|| y.iter().max().copied().unwrap_or(0) + 1)
+            .max(1);
+        let mf = if params.max_features == 0 {
+            (dim as f64).sqrt() as usize
+        } else {
+            params.max_features.min(dim)
+        };
         let max_depth = params.max_depth.clamp(1, MAX_DEPTH_CAP);
-        let trees: Vec<Vec<Node>> = (0..params.n_trees).into_par_iter().map(|t| {
-            let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ (t as u64 + 1));
-            let boot = bootstrap_indices(y, params.bootstrap, &mut rng, n_samples);
-            let bx: Vec<Vec<f64>> = boot.iter().map(|&i| x.row(i).to_vec()).collect();
-            let by: Vec<usize> = boot.iter().map(|&i| y[i]).collect();
-            let mut tree = Vec::new();
-            build_tree(&bx, &by, 0, max_depth, params.min_samples_split, mf, nc, &mut tree, &mut rng);
-            tree
-        }).collect();
-        Forest { trees, n_classes: nc, feature_dim: dim }
+        let trees: Vec<Vec<Node>> = (0..params.n_trees)
+            .into_par_iter()
+            .map(|t| {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ (t as u64 + 1));
+                let boot = bootstrap_indices(y, params.bootstrap, &mut rng, n_samples);
+                let bx: Vec<Vec<f64>> = boot.iter().map(|&i| x.row(i).to_vec()).collect();
+                let by: Vec<usize> = boot.iter().map(|&i| y[i]).collect();
+                let mut tree = Vec::new();
+                build_tree(
+                    &bx,
+                    &by,
+                    0,
+                    max_depth,
+                    params.min_samples_split,
+                    mf,
+                    nc,
+                    &mut tree,
+                    &mut rng,
+                );
+                tree
+            })
+            .collect();
+        Forest {
+            trees,
+            n_classes: nc,
+            feature_dim: dim,
+        }
     }
     pub fn predict(&self, feat: &[f64]) -> (usize, f64) {
         let p = self.predict_proba(feat);
-        p.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)).map(|(i, c)| (i, *c)).unwrap_or((0, 0.0))
+        p.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, c)| (i, *c))
+            .unwrap_or((0, 0.0))
     }
     pub fn predict_proba(&self, feat: &[f64]) -> Vec<f64> {
         let mut s = vec![0.0f64; self.n_classes];
-        for t in &self.trees { let n = traverse(t, feat); for (i, &p) in n.proba.iter().enumerate() { if i < s.len() { s[i] += p; } } }
+        for t in &self.trees {
+            let n = traverse(t, feat);
+            for (i, &p) in n.proba.iter().enumerate() {
+                if i < s.len() {
+                    s[i] += p;
+                }
+            }
+        }
         let n = self.trees.len().max(1) as f64;
-        for v in s.iter_mut() { *v /= n; }
+        for v in s.iter_mut() {
+            *v /= n;
+        }
         s
     }
 }
@@ -104,7 +145,9 @@ fn bootstrap_indices<R: Rng>(
 ) -> Vec<usize> {
     match mode {
         // 原实现：完全随机有放回采样
-        BootstrapMode::Random => (0..n_samples).map(|_| rng.gen_range(0..n_samples)).collect(),
+        BootstrapMode::Random => (0..n_samples)
+            .map(|_| rng.gen_range(0..n_samples))
+            .collect(),
         // 每类独立有放回采样，采样数等于该类样本数，从而保持类别比例
         BootstrapMode::Stratified => {
             let mut by_class: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -131,61 +174,140 @@ fn traverse<'a>(tree: &'a [Node], feat: &[f64]) -> &'a Node {
     let mut i = tree.len() - 1;
     loop {
         let n = &tree[i];
-        if n.feature == u32::MAX { return n; }
+        if n.feature == u32::MAX {
+            return n;
+        }
         let f = n.feature as usize;
-        if f >= feat.len() { return n; }
-        i = if feat[f] <= n.threshold { n.left as usize } else { n.right as usize };
+        if f >= feat.len() {
+            return n;
+        }
+        i = if feat[f] <= n.threshold {
+            n.left as usize
+        } else {
+            n.right as usize
+        };
         // 边界防御：索引越界则返回当前节点（若子节点索引损坏）
-        if i >= tree.len() { return n; }
+        if i >= tree.len() {
+            return n;
+        }
     }
 }
 
-fn build_tree<R: rand::Rng>(x: &[Vec<f64>], y: &[usize], depth: usize, max_depth: usize, min_split: usize, mf: usize, nc: usize, out: &mut Vec<Node>, rng: &mut R) -> u32 {
+fn build_tree<R: rand::Rng>(
+    x: &[Vec<f64>],
+    y: &[usize],
+    depth: usize,
+    max_depth: usize,
+    min_split: usize,
+    mf: usize,
+    nc: usize,
+    out: &mut Vec<Node>,
+    rng: &mut R,
+) -> u32 {
     let n = x.len();
     let pure = n > 0 && y.iter().all(|&v| v == y[0]);
     if depth >= max_depth || n < min_split || pure {
         let idx = out.len() as u32;
-        out.push(Node { feature: u32::MAX, threshold: 0.0, left: 0, right: 0, proba: class_proba(y, nc) });
+        out.push(Node {
+            feature: u32::MAX,
+            threshold: 0.0,
+            left: 0,
+            right: 0,
+            proba: class_proba(y, nc),
+        });
         return idx;
     }
     let dim = x[0].len();
     let mut feats: Vec<usize> = (0..dim).collect();
-    feats.shuffle(rng); feats.truncate(mf);
-    let mut bs = f64::MAX; let mut bf = 0u32; let mut bt = 0.0f64; let mut bl: Vec<usize> = Vec::new(); let mut br: Vec<usize> = Vec::new();
+    feats.shuffle(rng);
+    feats.truncate(mf);
+    let mut bs = f64::MAX;
+    let mut bf = 0u32;
+    let mut bt = 0.0f64;
+    let mut bl: Vec<usize> = Vec::new();
+    let mut br: Vec<usize> = Vec::new();
     let pg = gini(y, nc);
     for &f in &feats {
         let mut cv: Vec<(f64, usize)> = x.iter().enumerate().map(|(i, r)| (r[f], i)).collect();
         cv.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let mut thrs = Vec::new();
-        for i in 1..cv.len() { if (cv[i].0 - cv[i-1].0).abs() > 1e-12 { thrs.push((cv[i].0 + cv[i-1].0) / 2.0); } }
-        if thrs.is_empty() { continue; }
-        if thrs.len() > 16 { let s = thrs.len() / 16; thrs = thrs.into_iter().step_by(s.max(1)).collect(); }
+        for i in 1..cv.len() {
+            if (cv[i].0 - cv[i - 1].0).abs() > 1e-12 {
+                thrs.push((cv[i].0 + cv[i - 1].0) / 2.0);
+            }
+        }
+        if thrs.is_empty() {
+            continue;
+        }
+        if thrs.len() > 16 {
+            let s = thrs.len() / 16;
+            thrs = thrs.into_iter().step_by(s.max(1)).collect();
+        }
         for &t in &thrs {
-            let mut li = Vec::new(); let mut ri = Vec::new();
-            for &(v, i) in &cv { if v <= t { li.push(i); } else { ri.push(i); } }
-            if li.is_empty() || ri.is_empty() { continue; }
-            let gl = gini(&iy(y, &li), nc); let gr = gini(&iy(y, &ri), nc);
+            let mut li = Vec::new();
+            let mut ri = Vec::new();
+            for &(v, i) in &cv {
+                if v <= t {
+                    li.push(i);
+                } else {
+                    ri.push(i);
+                }
+            }
+            if li.is_empty() || ri.is_empty() {
+                continue;
+            }
+            let gl = gini(&iy(y, &li), nc);
+            let gr = gini(&iy(y, &ri), nc);
             let sc = pg - (li.len() as f64 / n as f64) * gl - (ri.len() as f64 / n as f64) * gr;
-            if sc < bs { bs = sc; bf = f as u32; bt = t; bl = li.clone(); br = ri.clone(); }
+            if sc < bs {
+                bs = sc;
+                bf = f as u32;
+                bt = t;
+                bl = li.clone();
+                br = ri.clone();
+            }
         }
     }
     if bs >= f64::MAX {
         let idx = out.len() as u32;
-        out.push(Node { feature: u32::MAX, threshold: 0.0, left: 0, right: 0, proba: class_proba(y, nc) });
+        out.push(Node {
+            feature: u32::MAX,
+            threshold: 0.0,
+            left: 0,
+            right: 0,
+            proba: class_proba(y, nc),
+        });
         return idx;
     }
-    let lx = ix(x, &bl); let ly = iy(y, &bl); let rx = ix(x, &br); let ry = iy(y, &br);
-    let lc = build_tree(&lx, &ly, depth+1, max_depth, min_split, mf, nc, out, rng);
-    let rc = build_tree(&rx, &ry, depth+1, max_depth, min_split, mf, nc, out, rng);
+    let lx = ix(x, &bl);
+    let ly = iy(y, &bl);
+    let rx = ix(x, &br);
+    let ry = iy(y, &br);
+    let lc = build_tree(&lx, &ly, depth + 1, max_depth, min_split, mf, nc, out, rng);
+    let rc = build_tree(&rx, &ry, depth + 1, max_depth, min_split, mf, nc, out, rng);
     let idx = out.len() as u32;
-    out.push(Node { feature: bf, threshold: bt, left: lc, right: rc, proba: Vec::new() });
+    out.push(Node {
+        feature: bf,
+        threshold: bt,
+        left: lc,
+        right: rc,
+        proba: Vec::new(),
+    });
     idx
 }
-fn iy(y: &[usize], i: &[usize]) -> Vec<usize> { i.iter().map(|&k| y[k]).collect() }
-fn ix(x: &[Vec<f64>], i: &[usize]) -> Vec<Vec<f64>> { i.iter().map(|&k| x[k].clone()).collect() }
+fn iy(y: &[usize], i: &[usize]) -> Vec<usize> {
+    i.iter().map(|&k| y[k]).collect()
+}
+fn ix(x: &[Vec<f64>], i: &[usize]) -> Vec<Vec<f64>> {
+    i.iter().map(|&k| x[k].clone()).collect()
+}
 fn class_proba(y: &[usize], nc: usize) -> Vec<f64> {
     let mut c = vec![0usize; nc];
-    for &v in y { if v < nc { c[v] += 1; } }
+    for &v in y {
+        if v < nc {
+            c[v] += 1;
+        }
+    }
     let n = y.len().max(1) as f64;
     c.into_iter().map(|v| v as f64 / n).collect()
 }

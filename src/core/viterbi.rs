@@ -306,11 +306,7 @@ mod tests {
             let offset = rng.gen_range(0..8);
             let pos2 = pos1.saturating_sub(offset);
             let score = rng.gen_range(0.4..1.6);
-            candidates.push(Candidate {
-                pos1,
-                pos2,
-                score,
-            });
+            candidates.push(Candidate { pos1, pos2, score });
         }
         // 打乱输入顺序，覆盖排序与并列前驱的选择路径
         candidates.shuffle(&mut rng);

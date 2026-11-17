@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::audio::ffmpeg;
+use crate::core::classify::model::load_model;
 use crate::core::classify::{classify_file_with_progress, ClassifyOptions};
 use crate::core::detect::{detect_ad_with_progress, DetectOptions};
-use crate::core::classify::model::load_model;
 use crate::core::range::Range;
 use crate::training::{TrainConfig, TrainSample};
 use crate::{pipeline, result_io};

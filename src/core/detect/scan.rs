@@ -104,7 +104,9 @@ fn best_matches(
         }
     }
 
-    if let Some(scores) = crate::core::matching::gpu::cosine_pairs(fft1, fft2, &pairs, HASH_WINDOW_SIZE) {
+    if let Some(scores) =
+        crate::core::matching::gpu::cosine_pairs(fft1, fft2, &pairs, HASH_WINDOW_SIZE)
+    {
         gpu_used.store(true, Ordering::Relaxed);
         return gpu_best_matches_recheck(fft1, fft2, groups, &scores);
     }
@@ -257,15 +259,18 @@ mod tests {
         let cpu_out = cpu_best_matches(&fft1, &fft2, &groups);
 
         // GPU 路径（走新的粗筛+精算）
-        let scores = gpu::cosine_pairs(&fft1, &fft2, &pairs, HASH_WINDOW_SIZE)
-            .expect("GPU 应返回结果");
+        let scores =
+            gpu::cosine_pairs(&fft1, &fft2, &pairs, HASH_WINDOW_SIZE).expect("GPU 应返回结果");
         let gpu_out = gpu_best_matches_recheck(&fft1, &fft2, &groups, &scores);
 
         assert_eq!(gpu_out.len(), cpu_out.len());
         for (idx, ((gi, gp, gs), (ci, cp, cs))) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
             assert_eq!(gi, ci, "group {idx}: frame index mismatch");
             assert_eq!(gp, cp, "group {idx}: BEST POSITION MISMATCH — gpu={gp} cpu={cp}, gpu_score={gs}, cpu_score={cs}");
-            assert!((gs - cs).abs() < 1e-12, "group {idx}: score mismatch gpu={gs} cpu={cs}");
+            assert!(
+                (gs - cs).abs() < 1e-12,
+                "group {idx}: score mismatch gpu={gs} cpu={cs}"
+            );
         }
     }
 
@@ -282,7 +287,10 @@ mod tests {
 
         let mut gpu_used = AtomicBool::new(false);
         let gpu_out = best_matches(&fft1, &fft2, &groups, &gpu_used);
-        assert!(gpu_used.load(std::sync::atomic::Ordering::Relaxed), "应实际走到 GPU 路径");
+        assert!(
+            gpu_used.load(std::sync::atomic::Ordering::Relaxed),
+            "应实际走到 GPU 路径"
+        );
 
         // CPU 参考结果
         let cpu_out = cpu_best_matches(&fft1, &fft2, &groups);
@@ -314,8 +322,8 @@ mod tests {
             }
         }
 
-        let scores = gpu::cosine_pairs(&fft1, &fft2, &pairs, HASH_WINDOW_SIZE)
-            .expect("GPU 应返回结果");
+        let scores =
+            gpu::cosine_pairs(&fft1, &fft2, &pairs, HASH_WINDOW_SIZE).expect("GPU 应返回结果");
 
         let mut k = 0usize;
         for &(i, ref positions) in &groups {

@@ -47,7 +47,9 @@ impl HpssParams {
 
 /// Hann 窗
 fn hann_window(n: usize) -> Vec<f64> {
-    (0..n).map(|i| 0.5 * (1.0 - (2.0 * PI * i as f64 / (n - 1) as f64).cos())).collect()
+    (0..n)
+        .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f64 / (n - 1) as f64).cos()))
+        .collect()
 }
 
 /// 中值滤波：1-D，边界复制
@@ -55,28 +57,38 @@ fn median_filter_1d(x: &[f64], kernel: usize) -> Vec<f64> {
     let k = kernel.max(1) | 1;
     let half = k / 2;
     let n = x.len();
-    if n == 0 { return Vec::new(); }
-    (0..n).map(|i| {
-        let lo = i.saturating_sub(half);
-        let hi = (i + half + 1).min(n);
-        let mut buf: Vec<f64> = Vec::with_capacity(hi - lo);
-        for j in lo..hi { buf.push(x[j]); }
-        buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mid = buf.len() / 2;
-        buf[mid]
-    }).collect()
+    if n == 0 {
+        return Vec::new();
+    }
+    (0..n)
+        .map(|i| {
+            let lo = i.saturating_sub(half);
+            let hi = (i + half + 1).min(n);
+            let mut buf: Vec<f64> = Vec::with_capacity(hi - lo);
+            for j in lo..hi {
+                buf.push(x[j]);
+            }
+            buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mid = buf.len() / 2;
+            buf[mid]
+        })
+        .collect()
 }
 
 /// 沿时间轴（帧方向）对功率谱做中值滤波
 fn median_filter_h(power: &[Vec<f64>], kernel: usize) -> Vec<Vec<f64>> {
     let n_frames = power.len();
-    if n_frames == 0 { return Vec::new(); }
+    if n_frames == 0 {
+        return Vec::new();
+    }
     let n_bins = power[0].len();
     let mut out: Vec<Vec<f64>> = vec![vec![0.0f64; n_bins]; n_frames];
     for k in 0..n_bins {
         let col: Vec<f64> = (0..n_frames).map(|t| power[t][k]).collect();
         let filtered = median_filter_1d(&col, kernel);
-        for t in 0..n_frames { out[t][k] = filtered[t]; }
+        for t in 0..n_frames {
+            out[t][k] = filtered[t];
+        }
     }
     out
 }
@@ -84,7 +96,9 @@ fn median_filter_h(power: &[Vec<f64>], kernel: usize) -> Vec<Vec<f64>> {
 /// 沿频率轴（bin 方向）对功率谱做中值滤波
 fn median_filter_p(power: &[Vec<f64>], kernel: usize) -> Vec<Vec<f64>> {
     let n_frames = power.len();
-    if n_frames == 0 { return Vec::new(); }
+    if n_frames == 0 {
+        return Vec::new();
+    }
     let mut out: Vec<Vec<f64>> = Vec::with_capacity(n_frames);
     for row in power {
         let filtered = median_filter_1d(row, kernel);
@@ -118,7 +132,11 @@ fn soft_masks(power: &[Vec<f64>], params: &HpssParams) -> (Vec<Vec<f64>>, Vec<Ve
 fn stft_complex(samples: &[f64], n_fft: usize, hop: usize) -> Vec<Vec<(f64, f64)>> {
     use rustfft::{num_complex::Complex64, FftPlanner};
     let window = hann_window(n_fft);
-    let n_frames = if samples.len() < n_fft { 1 } else { (samples.len() - n_fft) / hop + 1 };
+    let n_frames = if samples.len() < n_fft {
+        1
+    } else {
+        (samples.len() - n_fft) / hop + 1
+    };
     let bins = n_fft / 2 + 1;
     let mut result: Vec<Vec<(f64, f64)>> = vec![vec![(0.0, 0.0); bins]; n_frames];
     let mut planner = FftPlanner::<f64>::new();
@@ -132,21 +150,31 @@ fn stft_complex(samples: &[f64], n_fft: usize, hop: usize) -> Vec<Vec<(f64, f64)
             buf[k].im = 0.0;
         }
         fft.process(&mut buf);
-        for k in 0..bins { result[fi][k] = (buf[k].re, buf[k].im); }
+        for k in 0..bins {
+            result[fi][k] = (buf[k].re, buf[k].im);
+        }
     }
     result
 }
 
 /// 复数频谱 → 功率谱 Vec<Vec<f64>>
 fn power_spectrum(spec: &[Vec<(f64, f64)>]) -> Vec<Vec<f64>> {
-    spec.iter().map(|row| row.iter().map(|(re, im)| re * re + im * im).collect()).collect()
+    spec.iter()
+        .map(|row| row.iter().map(|(re, im)| re * re + im * im).collect())
+        .collect()
 }
 
 /// soft mask × 原复数频谱
 fn apply_mask(spec: &[Vec<(f64, f64)>], mask: &[Vec<f64>]) -> Vec<Vec<(f64, f64)>> {
-    spec.iter().zip(mask.iter()).map(|(row, mrow)| {
-        row.iter().zip(mrow.iter()).map(|((re, im), m)| (*re * m, *im * m)).collect()
-    }).collect()
+    spec.iter()
+        .zip(mask.iter())
+        .map(|(row, mrow)| {
+            row.iter()
+                .zip(mrow.iter())
+                .map(|((re, im), m)| (*re * m, *im * m))
+                .collect()
+        })
+        .collect()
 }
 
 /// iSTFT 回时域（用合成 Hann 窗 + overlap-add + 归一化）
@@ -154,7 +182,9 @@ fn istft(spec: &[Vec<(f64, f64)>], n_fft: usize, hop: usize) -> Vec<f64> {
     use rustfft::{num_complex::Complex64, FftPlanner};
     let window = hann_window(n_fft);
     let n_frames = spec.len();
-    if n_frames == 0 { return Vec::new(); }
+    if n_frames == 0 {
+        return Vec::new();
+    }
     let total = (n_frames - 1) * hop + n_fft;
     let mut out = vec![0.0f64; total];
     let mut w_sum = vec![0.0f64; total];
@@ -193,14 +223,18 @@ fn istft(spec: &[Vec<(f64, f64)>], n_fft: usize, hop: usize) -> Vec<f64> {
         let norm = 1.0 / n_fft as f64;
         for k in 0..n_fft {
             let t = start + k;
-            if t >= total { break; }
+            if t >= total {
+                break;
+            }
             out[t] += buf[k].re * norm * window[k];
             w_sum[t] += window[k] * window[k];
         }
     }
 
     for t in 0..total {
-        if w_sum[t] > 1e-10 { out[t] /= w_sum[t]; }
+        if w_sum[t] > 1e-10 {
+            out[t] /= w_sum[t];
+        }
     }
 
     out
@@ -215,8 +249,12 @@ pub fn hpss_separate(
     n_fft: usize,
     hop: usize,
 ) -> Result<(Vec<f64>, Vec<f64>)> {
-    if samples.is_empty() { bail!("空音频"); }
-    if samples.len() < n_fft { bail!("音频过短，无法 HPSS"); }
+    if samples.is_empty() {
+        bail!("空音频");
+    }
+    if samples.len() < n_fft {
+        bail!("音频过短，无法 HPSS");
+    }
 
     let spec = stft_complex(samples, n_fft, hop);
     let power = power_spectrum(&spec);
@@ -254,7 +292,9 @@ mod tests {
         let x = vec![1.0f64; 100];
         let y = median_filter_1d(&x, 7);
         assert_eq!(y.len(), 100);
-        for v in y { assert!((v - 1.0).abs() < 1e-10); }
+        for v in y {
+            assert!((v - 1.0).abs() < 1e-10);
+        }
     }
 
     #[test]
@@ -278,10 +318,13 @@ mod tests {
         // 在 0.5s, 1.0s, 1.5s 处加冲击
         for &pos in &[sr / 2, sr, sr + sr / 2] {
             for j in 0..8 {
-                if pos + j < n { sig[pos + j] += 0.9 * (1.0 - j as f64 / 8.0); }
+                if pos + j < n {
+                    sig[pos + j] += 0.9 * (1.0 - j as f64 / 8.0);
+                }
             }
         }
-        let (harm, perc) = hpss_separate(&sig, &HpssParams::default(), HPSS_N_FFT, HPSS_HOP).unwrap();
+        let (harm, perc) =
+            hpss_separate(&sig, &HpssParams::default(), HPSS_N_FFT, HPSS_HOP).unwrap();
         // HPSS 尾部会丢失少量采样（STFT 固有），这里只检查最小长度
         assert!(harm.len() >= n - HPSS_N_FFT);
         assert!(perc.len() >= n - HPSS_N_FFT);
@@ -289,6 +332,9 @@ mod tests {
         let e_h: f64 = harm.iter().map(|v| v * v).sum();
         let e_p: f64 = perc.iter().map(|v| v * v).sum();
         let ratio = e_h.max(e_p) / (e_h.min(e_p) + 1e-12);
-        assert!(ratio > 1.2, "harmonic should dominate: e_h={e_h:.4}, e_p={e_p:.4}, ratio={ratio:.2}");
+        assert!(
+            ratio > 1.2,
+            "harmonic should dominate: e_h={e_h:.4}, e_p={e_p:.4}, ratio={ratio:.2}"
+        );
     }
 }

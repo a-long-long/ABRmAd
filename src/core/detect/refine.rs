@@ -264,9 +264,7 @@ fn refine_boundaries(
             break;
         }
         let pos = e - 1;
-        if p1 + pos + BOUNDARY_REFINE_WINDOW > len1
-            || p2 + pos + BOUNDARY_REFINE_WINDOW > len2
-        {
+        if p1 + pos + BOUNDARY_REFINE_WINDOW > len1 || p2 + pos + BOUNDARY_REFINE_WINDOW > len2 {
             e -= 1;
             continue;
         }
