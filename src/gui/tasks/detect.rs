@@ -101,6 +101,9 @@ pub(crate) fn start_detection(state: &SharedState) {
                     result.ranges.into_iter().zip(result.lengths).enumerate()
                 {
                     if let Some(file) = s.files.get_mut(i) {
+                        // 重新检测后广告段索引可能整体变化，旧的删除标记必须先清空，
+                        // 否则保存时会把标记套到错误的段上
+                        file.marked_for_deletion.clear();
                         if length == 0 {
                             // 预处理失败（FFT 为空）。GUI 没有控制台，stderr 警告不可见，
                             // 这里显式清空状态而不是伪装成"已检测"。
@@ -108,6 +111,7 @@ pub(crate) fn start_detection(state: &SharedState) {
                             file.event_ranges.clear();
                             file.length = 0;
                             file.detected = false;
+                            file.classified = false;
                             file.needs_save = false;
                             failed += 1;
                         } else {
@@ -118,6 +122,8 @@ pub(crate) fn start_detection(state: &SharedState) {
                         }
                     }
                 }
+                // 检测结果刷新后，旧的选中段（文件索引 + 广告索引）同样失效
+                s.ads_to_delete.clear();
                 s.is_processing = false;
                 s.progress = 1.0;
                 let mut message = match &result.gpu {
