@@ -226,6 +226,9 @@ pub(super) fn fine_tune_multi(
 }
 
 /// 逐帧精修区间边界：两侧各自向内收缩，最多 `BOUNDARY_REFINE_MAX_SHIFT` 帧
+///
+/// `start`/`end` 是文件 1 中的绝对帧位置；文件 2 的对应位置由 `p2 - p1`
+/// 的偏移换算，且窗口必须完整落在两个文件内。
 fn refine_boundaries(
     feat1: &AudioFeatures,
     feat2: &AudioFeatures,
@@ -237,19 +240,31 @@ fn refine_boundaries(
     let len1 = feat1.fft.nrows();
     let len2 = feat2.fft.nrows();
     let (mut s, mut e) = (start, end);
+    // file1 与 file2 的对齐偏移
+    let shift = p2 as i64 - p1 as i64;
+
+    // file2 中与 file1 绝对位置 pos 对齐的起点；窗口越界时返回 None
+    let aligned = |pos: usize| -> Option<usize> {
+        if pos + BOUNDARY_REFINE_WINDOW > len1 {
+            return None;
+        }
+        let b = pos as i64 + shift;
+        if b < 0 || b as usize + BOUNDARY_REFINE_WINDOW > len2 {
+            return None;
+        }
+        Some(b as usize)
+    };
 
     for _ in 0..BOUNDARY_REFINE_MAX_SHIFT {
         if e.saturating_sub(s) <= 2 {
             break;
         }
-        if p1 + s + BOUNDARY_REFINE_WINDOW > len1 || p2 + s + BOUNDARY_REFINE_WINDOW > len2 {
-            break;
-        }
+        let Some(b) = aligned(s) else { break };
         let sim = features::multi_feature_sim(
             feat1,
             feat2,
-            p1 + s,
-            p2 + s,
+            s,
+            b,
             BOUNDARY_REFINE_WINDOW,
             &FEATURE_WEIGHTS,
         );
@@ -264,22 +279,24 @@ fn refine_boundaries(
             break;
         }
         let pos = e - 1;
-        if p1 + pos + BOUNDARY_REFINE_WINDOW > len1 || p2 + pos + BOUNDARY_REFINE_WINDOW > len2 {
-            e -= 1;
-            continue;
+        match aligned(pos) {
+            Some(b) => {
+                let sim = features::multi_feature_sim(
+                    feat1,
+                    feat2,
+                    pos,
+                    b,
+                    BOUNDARY_REFINE_WINDOW,
+                    &FEATURE_WEIGHTS,
+                );
+                if sim >= BOUNDARY_REFINE_THRESHOLD {
+                    break;
+                }
+                e -= 1;
+            }
+            // 窗口越界时同样向内收缩
+            None => e -= 1,
         }
-        let sim = features::multi_feature_sim(
-            feat1,
-            feat2,
-            p1 + pos,
-            p2 + pos,
-            BOUNDARY_REFINE_WINDOW,
-            &FEATURE_WEIGHTS,
-        );
-        if sim >= BOUNDARY_REFINE_THRESHOLD {
-            break;
-        }
-        e -= 1;
     }
 
     (s, e)
@@ -374,4 +391,58 @@ pub(super) fn create_range(ranges: &mut Vec<Range>, len: usize, add: Range) -> O
     }
 
     Some(add)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::dsp::fft::FREQ_BINS;
+    use ndarray::Array2;
+
+    fn frame_values(frame: usize, width: usize, salt: usize) -> Vec<f64> {
+        (0..width)
+            .map(|k| (((frame * 37 + k * 11 + salt) as f64) * 0.017).sin())
+            .collect()
+    }
+
+    /// 构造特征：`shift` 为 Some 时整体右移（模拟第二个文件的对齐偏移），
+    /// `mismatch` 中的帧取反，模拟不相似的边界帧
+    fn make_features(rows: usize, shift: Option<usize>, mismatch: &[usize]) -> AudioFeatures {
+        let mut fft = Array2::zeros((rows, FREQ_BINS));
+        let mut mfcc = Array2::zeros((rows, 13));
+        let mut chroma = Array2::zeros((rows, 12));
+
+        for r in 0..rows {
+            let src = match shift {
+                Some(s) if r >= s => r - s,
+                Some(_) => r + 1000,
+                None => r,
+            };
+            let sign = if mismatch.contains(&r) { -1.0 } else { 1.0 };
+
+            for (k, v) in frame_values(src, FREQ_BINS, 1).into_iter().enumerate() {
+                fft[[r, k]] = sign * v;
+            }
+            for (k, v) in frame_values(src, 13, 2).into_iter().enumerate() {
+                mfcc[[r, k]] = sign * v;
+            }
+            for (k, v) in frame_values(src, 12, 3).into_iter().enumerate() {
+                chroma[[r, k]] = sign * v;
+            }
+        }
+
+        AudioFeatures { fft, mfcc, chroma }
+    }
+
+    #[test]
+    fn refine_boundaries_uses_aligned_absolute_positions() {
+        // file2 是 file1 右移 50 帧的副本，只有 file2 的 149 帧不相似
+        let feat1 = make_features(400, None, &[]);
+        let feat2 = make_features(500, Some(50), &[149]);
+
+        // 区间起点 99 与 file2 的 149 对齐（不相似）→ 应收缩到 100
+        let (s, e) = refine_boundaries(&feat1, &feat2, 100, 150, 99, 201);
+        assert_eq!(s, 100, "起点应向内收缩到第一个高相似度帧");
+        assert_eq!(e, 201, "终点本身相似，不应被误收缩");
+    }
 }
