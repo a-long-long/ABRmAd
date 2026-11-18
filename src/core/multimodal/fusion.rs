@@ -8,7 +8,6 @@
 //! 2. 区间完全在无字幕覆盖的静音段 → score × silence_penalty（默认 0.7）
 //! 3. 区间时间范围 0 或 score 已为 0 → 不做改动
 
-use crate::core::detect::Thresholds;
 use crate::core::multimodal::srt::Subtitle;
 use crate::core::range::Range;
 
@@ -71,15 +70,6 @@ impl FusionConfig {
             ..Default::default()
         }
     }
-    fn active_keywords(&self) -> &[&str] {
-        if self.keywords.is_empty() {
-            DEFAULT_KEYWORDS
-        } else {
-            // 把 Vec<String> 转成 &[&str]（生命周期借由调用方保证）
-            // 这里简单返回 DEFAULT_KEYWORDS，关键词匹配时用闭包捕获 keywords
-            DEFAULT_KEYWORDS
-        }
-    }
 }
 
 /// 用字幕重加权区间
@@ -88,26 +78,23 @@ impl FusionConfig {
 /// - `ranges`: 检测输出的区间列表（会被就地修改 score 字段）
 /// - `subtitles`: 该文件对应的字幕列表（空 Vec 表示无字幕）
 /// - `config`: 融合配置
-/// - `len_frames`: 文件总帧数（用于从区间帧数换算秒数）
-pub fn reweight_ranges(
-    ranges: &mut [Range],
-    subtitles: &[Subtitle],
-    config: &FusionConfig,
-    len_frames: usize,
-) {
+pub fn reweight_ranges(ranges: &mut [Range], subtitles: &[Subtitle], config: &FusionConfig) {
     if ranges.is_empty() {
         return;
     }
 
-    let keywords: Vec<&str> = if config.keywords.is_empty() {
-        DEFAULT_KEYWORDS.to_vec()
+    // 关键词与字幕文本的小写化只在循环外做一次：
+    // 文件长、字幕多时避免 O(区间 × 字幕 × 关键词) 次重复分配与转换。
+    let keywords: Vec<String> = if config.keywords.is_empty() {
+        DEFAULT_KEYWORDS
+            .iter()
+            .map(|kw| kw.to_lowercase())
+            .collect()
     } else {
-        config.keywords.iter().map(String::as_str).collect()
+        config.keywords.iter().map(|kw| kw.to_lowercase()).collect()
     };
+    let sub_texts: Vec<String> = subtitles.iter().map(|s| s.text.to_lowercase()).collect();
 
-    // 先构建帧索引 → 秒数转换后的字幕覆盖区间，方便二分查找
-    // Subtitle.start/end 已是秒
-    // Range.begin/end 是帧号，需要转秒
     for r in ranges.iter_mut() {
         if r.end <= r.begin || r.score <= 0.0 {
             continue;
@@ -116,26 +103,21 @@ pub fn reweight_ranges(
         let r_start = r.begin as f64 * FRAME_SEC;
         let r_end = r.end as f64 * FRAME_SEC;
 
-        // 字幕时间边界
-        let total_sec = len_frames as f64 * FRAME_SEC;
-
         // 规则 1 & 2：遍历与该 range 时间重叠的字幕
-        let mut hit_keywords = Vec::new();
+        let mut hit_keywords = 0usize;
         let mut overlap_sec = 0.0;
 
-        for sub in subtitles {
+        for (sub, lower) in subtitles.iter().zip(&sub_texts) {
             let s_overlap = (sub.end.min(r_end) - sub.start.max(r_start)).max(0.0);
             if s_overlap > 0.0 {
                 overlap_sec += s_overlap;
                 // 关键词匹配（大小写不敏感、子串包含）
-                let lower = sub.text.to_lowercase();
                 for kw in &keywords {
                     if kw.is_empty() {
                         continue;
                     }
-                    let kw_lower = kw.to_lowercase();
-                    if lower.contains(&kw_lower) {
-                        hit_keywords.push(kw);
+                    if lower.contains(kw.as_str()) {
+                        hit_keywords += 1;
                     }
                 }
             }
@@ -149,7 +131,7 @@ pub fn reweight_ranges(
         let range_dur = (r_end - r_start).max(1e-6);
         let overlap_ratio = overlap_sec / range_dur;
 
-        if hit_keywords.is_empty() {
+        if hit_keywords == 0 {
             // 规则 2：完全无关键词命中 → 根据字幕覆盖比例决定是否惩罚
             if overlap_ratio < 0.3 {
                 // 覆盖极少，可能是"碰巧匹配的静音段"
@@ -158,28 +140,24 @@ pub fn reweight_ranges(
             // 有字幕覆盖但没关键词 → 不加分不减分（正常节目内容）
         } else {
             // 规则 1：有关键词命中 → boost 倍 + 按关键词数量叠加
-            let n_hits = hit_keywords.len().min(5); // 最多叠 5 个关键词
+            let n_hits = hit_keywords.min(5); // 最多叠 5 个关键词
             let boost = config.keyword_boost * (1.0 + 0.05 * n_hits as f64); // 每多一个 +5%
             r.score *= boost;
         }
 
         // clip 到 [0, 1]
         r.score = r.score.clamp(0.0, 1.0);
-
-        let _ = total_sec; // 暂未使用，保留以提示未来可以做"节目结束时段"融合
     }
 }
 
 /// 便捷函数：按文件名（去掉扩展名）自动匹配 SRT
 ///
-/// 输入：文件列表 + SRT 目录 + 可选额外扩展列表
+/// 输入：文件列表 + SRT 目录
 /// 输出：与 files 顺序一一对应的字幕列表（无匹配时是 empty Vec）
-pub fn load_subtitles_by_basename<'a>(
-    files: &'a [std::path::PathBuf],
+pub fn load_subtitles_by_basename(
+    files: &[std::path::PathBuf],
     srt_dir: &std::path::Path,
 ) -> Vec<Vec<Subtitle>> {
-    use std::fs;
-
     let mut out = Vec::with_capacity(files.len());
     for f in files {
         let base = f
@@ -234,7 +212,7 @@ mod tests {
             end: 5.0,
             text: "立即购买，限时优惠！".to_string(),
         }];
-        reweight_ranges(&mut ranges, &subs, &FusionConfig::default(), 1000);
+        reweight_ranges(&mut ranges, &subs, &FusionConfig::default());
         // boost = 1.25 × (1 + 0.05×3) ≈ 1.4375 (3 个关键词: 立即/购买/优惠)
         assert!(ranges[0].score > 0.70, "关键词命中后应加分");
         assert!(ranges[0].score <= 1.0);
@@ -249,7 +227,7 @@ mod tests {
             text: "接下来是一段精彩的节目".to_string(),
         }];
         let before = ranges[0].score;
-        reweight_ranges(&mut ranges, &subs, &FusionConfig::default(), 1000);
+        reweight_ranges(&mut ranges, &subs, &FusionConfig::default());
         assert!((ranges[0].score - before).abs() < 1e-9);
     }
 
@@ -262,7 +240,7 @@ mod tests {
             end: 5.0,
             text: "节目开始".to_string(),
         }];
-        reweight_ranges(&mut ranges, &subs, &FusionConfig::default(), 2000);
+        reweight_ranges(&mut ranges, &subs, &FusionConfig::default());
         assert!(ranges[0].score < 0.70, "无字幕覆盖时应惩罚");
     }
 
@@ -270,7 +248,7 @@ mod tests {
     fn empty_subtitles_preserves_score() {
         let mut ranges = vec![make_range(100, 500, 0.70)];
         let before = ranges[0].score;
-        reweight_ranges(&mut ranges, &[], &FusionConfig::default(), 1000);
+        reweight_ranges(&mut ranges, &[], &FusionConfig::default());
         assert!((ranges[0].score - before).abs() < 1e-9);
     }
 
@@ -282,7 +260,7 @@ mod tests {
             end: 5.0,
             text: "限时优惠立即购买特价折扣".to_string(), // 5+ 关键词
         }];
-        reweight_ranges(&mut ranges, &subs, &FusionConfig::default(), 1000);
+        reweight_ranges(&mut ranges, &subs, &FusionConfig::default());
         assert!(ranges[0].score <= 1.0, "分数不能超过 1.0");
     }
 
@@ -295,7 +273,7 @@ mod tests {
             end: 4.0,
             text: "限时".to_string(),
         }];
-        reweight_ranges(&mut ranges, &subs, &FusionConfig::default(), 1000);
+        reweight_ranges(&mut ranges, &subs, &FusionConfig::default());
         // 有关键词命中 → boost（2 个：限时/限时）
         assert!(ranges[0].score > 0.70);
     }
@@ -309,7 +287,21 @@ mod tests {
             text: "阿巴阿巴的广告".to_string(), // 默认关键词一个都没
         }];
         let cfg = FusionConfig::with_keywords(vec!["阿巴".to_string()]);
-        reweight_ranges(&mut ranges, &subs, &cfg, 1000);
+        reweight_ranges(&mut ranges, &subs, &cfg);
         assert!(ranges[0].score > 0.70, "自定义关键词应生效");
+    }
+
+    /// 关键词与字幕文本的大小写不敏感匹配（两侧小写化都要生效）
+    #[test]
+    fn keyword_matching_is_case_insensitive() {
+        let mut ranges = vec![make_range(100, 500, 0.50)];
+        let subs = vec![Subtitle {
+            start: 1.0,
+            end: 5.0,
+            text: "LIMITED Offer：ORDER NOW".to_string(),
+        }];
+        let cfg = FusionConfig::with_keywords(vec!["limited".to_string(), "Order".to_string()]);
+        reweight_ranges(&mut ranges, &subs, &cfg);
+        assert!(ranges[0].score > 0.50, "大小写不同的关键词也应命中");
     }
 }

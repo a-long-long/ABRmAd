@@ -491,7 +491,6 @@ where
     }
 
     // ---- 字幕融合（保守 A：不改检测管线，结果重打分） ----
-    #[allow(unused_mut)]
     let mut fusion_apply_count = 0usize;
     if let Some(mm) = &opts.multimodal {
         if !mm.loaded_subtitles.is_empty() {
@@ -499,16 +498,23 @@ where
                 if i >= ranges.len() || file_subs.is_empty() {
                     continue;
                 }
-                let file_len = lengths.get(i).copied().unwrap_or(0);
                 crate::core::multimodal::fusion::reweight_ranges(
                     &mut ranges[i],
                     file_subs,
                     &mm.fusion_config,
-                    file_len,
                 );
                 fusion_apply_count += 1;
             }
         }
+    }
+    if fusion_apply_count > 0 {
+        on_progress(
+            (total_steps - 1) as f32 / total_steps as f32,
+            &format!(
+                "Phase 3/3 · 字幕融合：{} 个文件重新打分",
+                fusion_apply_count
+            ),
+        );
     }
 
     // ---- Debug 导出 ----
