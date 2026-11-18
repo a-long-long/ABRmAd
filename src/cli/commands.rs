@@ -94,6 +94,9 @@ enum Commands {
         test_split: f64,
         #[arg(long, default_value = "42")]
         seed: u64,
+        /// 启用在线增强（默认时移 + 音量 ±2dB，样本数约 ×5）
+        #[arg(long)]
+        augment: bool,
     },
 
     /// 用事件分类模型对音频文件打标签
@@ -146,7 +149,10 @@ pub fn run() -> Result<()> {
             max_depth,
             test_split,
             seed,
-        } => cmd_train(&data_list, &output, trees, max_depth, test_split, seed),
+            augment,
+        } => cmd_train(
+            &data_list, &output, trees, max_depth, test_split, seed, augment,
+        ),
         Commands::Classify {
             files,
             model,
@@ -373,6 +379,7 @@ fn cmd_train(
     max_depth: usize,
     test_split: f64,
     seed: u64,
+    augment: bool,
 ) -> Result<()> {
     let list_dir = data_list.parent().unwrap_or(Path::new("."));
     let content = std::fs::read_to_string(data_list)?;
@@ -412,6 +419,20 @@ fn cmd_train(
 
     println!("训练随机森林事件分类模型...");
     println!("样本: {}, 标签: {:?}", samples.len(), labels);
+    let augment_config = if augment {
+        crate::training::AugmentConfig::default_on()
+    } else {
+        crate::training::AugmentConfig::default()
+    };
+    if augment_config.enable {
+        println!(
+            "在线增强: 开启 (时移={}, 音量={}, 白噪={}, 拉伸={})",
+            augment_config.shift,
+            augment_config.volume,
+            augment_config.noise,
+            augment_config.stretch
+        );
+    }
 
     let config = TrainConfig {
         n_trees: trees,
@@ -420,7 +441,8 @@ fn cmd_train(
         seed,
         ..Default::default()
     };
-    let report = crate::training::train_model(&samples, &config, output, |_, _| {})?;
+    let report =
+        crate::training::train_model(&samples, &config, output, |_, _| {}, &augment_config)?;
 
     println!("窗口扩展后样本: {}", report.samples);
     println!("\n测试集评估:");

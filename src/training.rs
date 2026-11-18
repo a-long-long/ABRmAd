@@ -5,8 +5,9 @@
 
 use anyhow::{bail, Result};
 use ndarray::Array2;
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
+use rand::{RngCore, SeedableRng};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -75,6 +76,54 @@ impl Default for TrainConfig {
     }
 }
 
+/// 在线增强配置
+///
+/// 默认启用时移 + 音量（最自然的扰动，不改变音色特征分布），
+/// 白噪和拉伸更激进，通过开关启用。增强在采样空间做（输入级），
+/// 不影响 DSP 管线的特征提取逻辑。
+///
+/// 每种增强产出的变体数：
+/// - 时移 ±100ms → 2 个（后补零 / 前补零）
+/// - 音量 ±2dB   → 2 个（×1.258 / ×0.794）
+/// - 白噪 -30dB  → 1 个（独立同分布白噪）
+/// - 时间拉伸 0.9×/1.1× → 2 个（线性插值）
+#[derive(Debug, Clone)]
+pub struct AugmentConfig {
+    pub enable: bool,
+    pub shift: bool,
+    pub volume: bool,
+    pub noise: bool,
+    pub stretch: bool,
+}
+
+impl Default for AugmentConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            shift: true,
+            volume: true,
+            noise: false,
+            stretch: false,
+        }
+    }
+}
+
+impl AugmentConfig {
+    /// 默认启用前两种（时移 + 音量），白噪和拉伸关闭
+    pub fn default_on() -> Self {
+        Self::default_with(true, true, false, false)
+    }
+    fn default_with(shift: bool, volume: bool, noise: bool, stretch: bool) -> Self {
+        Self {
+            enable: shift || volume || noise || stretch,
+            shift,
+            volume,
+            noise,
+            stretch,
+        }
+    }
+}
+
 /// 单个标签的测试集指标
 #[derive(Debug, Clone)]
 pub struct LabelMetrics {
@@ -103,11 +152,16 @@ pub struct TrainReport {
 ///
 /// `on_progress(progress, message)` 在特征提取阶段被并行调用，
 /// 因此要求 `Sync`。
+///
+/// `augment_config` 控制是否对原始样本做在线增强。增强在采样空间
+/// 做，不改变 DSP 管线逻辑；每种增强产出独立变体，与原始样本
+/// 一起滑窗提特征。关闭时退化为原始行为。
 pub fn train_model<F>(
     samples: &[TrainSample],
     config: &TrainConfig,
     output: &Path,
     on_progress: F,
+    augment_config: &AugmentConfig,
 ) -> Result<TrainReport>
 where
     F: Fn(f32, &str) + Sync,
@@ -143,19 +197,34 @@ where
     // 1. 解码 + 滑窗提特征（并行）
     let total = samples.len();
     let done = AtomicUsize::new(0);
+    let augment_seed_base = config.seed;
     let extracted: Vec<Result<Vec<(Vec<f64>, usize)>>> = samples
         .par_iter()
-        .map(|sample| {
+        .enumerate()
+        .map(|(sample_idx, sample)| {
             let raw = decode_samples(&sample.path)?;
             let slice = sample_slice(&raw, sample.split);
+
+            // 在线增强：原始切片 + 增强变体
+            let variants: Vec<Vec<f64>> = if augment_config.enable && slice.len() >= ws {
+                augment_sample(slice, augment_config, augment_seed_base, sample_idx)
+            } else {
+                vec![slice.to_vec()]
+            };
+
+            let label_idx = label_to_idx[&sample.label];
             let mut rows = Vec::new();
-            if slice.len() >= ws {
-                let n_windows = (slice.len() - ws) / hs + 1;
+            for variant in &variants {
+                if variant.len() < ws {
+                    continue;
+                }
+                let n_windows = (variant.len() - ws) / hs + 1;
                 for j in 0..n_windows {
-                    let feat = extract_segment_features(&slice[j * hs..j * hs + ws])?;
-                    rows.push((feat.to_vec(), label_to_idx[&sample.label]));
+                    let feat = extract_segment_features(&variant[j * hs..j * hs + ws])?;
+                    rows.push((feat.to_vec(), label_idx));
                 }
             }
+
             let step = done.fetch_add(1, Ordering::Relaxed) + 1;
             let name = sample
                 .path
@@ -353,6 +422,99 @@ fn sample_slice<'a>(raw: &'a [f64], split: Option<(usize, usize)>) -> &'a [f64] 
     &raw[start..end]
 }
 
+/// 在线增强：在采样空间生成原始切片的多个变体
+///
+/// 永远返回至少一个元素（原始切片本身）。额外变体由 AugmentConfig
+/// 控制开关；每种增强独立产出，不做组合，避免样本分布被过度扭曲。
+///
+/// 确定性：白噪需要随机数，用 `augment_seed_base + sample_idx` 作为
+/// 该样本专属种子，保证相同输入产生相同输出。
+///
+/// 边界：`slice.len() < ws` 的情况由调用方跳过，这里仍按原始长度增强。
+fn augment_sample(
+    slice: &[f64],
+    cfg: &AugmentConfig,
+    seed_base: u64,
+    sample_idx: usize,
+) -> Vec<Vec<f64>> {
+    let mut out: Vec<Vec<f64>> = Vec::with_capacity(
+        1 + cfg.shift as usize * 2
+            + cfg.volume as usize * 2
+            + cfg.noise as usize
+            + cfg.stretch as usize * 2,
+    );
+    out.push(slice.to_vec());
+
+    let n = slice.len();
+    if n < 4 {
+        return out;
+    }
+
+    if cfg.shift {
+        // ±100ms = ±2205 采样（SEG_SR=22050）
+        let shift_samples = (SEG_SR as f64 * 0.1).round() as usize;
+        let shift = shift_samples.min(n / 4); // 安全上限：不超过总长 25%
+        if shift > 0 && n > shift {
+            // +100ms 向后平移，前补零
+            let mut pos = vec![0.0f64; n];
+            pos[shift..].copy_from_slice(&slice[..n - shift]);
+            out.push(pos);
+            // -100ms 向前平移，后补零
+            let mut neg = vec![0.0f64; n];
+            neg[..n - shift].copy_from_slice(&slice[shift..]);
+            out.push(neg);
+        }
+    }
+
+    if cfg.volume {
+        let amp_plus = 10.0f64.powf(2.0 / 20.0); // ≈ 1.258
+        let amp_minus = 10.0f64.powf(-2.0 / 20.0); // ≈ 0.794
+        out.push(slice.iter().map(|x| x * amp_plus).collect());
+        out.push(slice.iter().map(|x| x * amp_minus).collect());
+    }
+
+    if cfg.noise {
+        let mut rng = StdRng::seed_from_u64(
+            seed_base
+                .wrapping_add(sample_idx as u64)
+                .wrapping_mul(0x9E3779B97F4A7C15),
+        );
+        // -30dB SNR：噪声能量 = 信号能量 / 1000
+        let signal_power: f64 = slice.iter().map(|x| x * x).sum::<f64>() / n as f64;
+        let noise_power: f64 = signal_power / 1000.0;
+        let noise_std = noise_power.sqrt();
+        // 独立同分布高斯噪声（Box-Muller）
+        let mut rng_iter = || -> f64 {
+            let u1: f64 = rng.next_u64() as f64 / u64::MAX as f64;
+            let u2: f64 = rng.next_u64() as f64 / u64::MAX as f64;
+            let u1 = u1.max(1e-12);
+            (-2.0_f64 * u1.ln()).sqrt() * (2.0_f64 * std::f64::consts::PI * u2).cos()
+        };
+        out.push(slice.iter().map(|x| x + rng_iter() * noise_std).collect());
+    }
+
+    if cfg.stretch {
+        // 0.9× 慢放 / 1.1× 快进，线性插值
+        for &ratio in &[0.9_f64, 1.1_f64] {
+            let new_len = ((n as f64) * ratio).round().max(1.0) as usize;
+            if new_len == n {
+                continue;
+            }
+            let mut stretched = Vec::with_capacity(new_len);
+            for i in 0..new_len {
+                let src = i as f64 / ratio;
+                let lo = src.floor() as usize;
+                let hi = (lo + 1).min(n - 1);
+                let frac = src - lo as f64;
+                stretched.push(slice[lo] * (1.0 - frac) + slice[hi] * frac);
+            }
+            out.push(stretched);
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,8 +544,100 @@ mod tests {
             &TrainConfig::default(),
             Path::new("model.mcrf"),
             |_, _| {},
+            &AugmentConfig::default(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("两种标签"));
+    }
+
+    /// AugmentConfig::default() 关闭增强，default_on() 开启 shift+volume
+    #[test]
+    fn augment_config_defaults() {
+        let off = AugmentConfig::default();
+        assert!(!off.enable);
+        assert!(off.shift); // 字段保持 true 但 enable=false 时整体不生效
+        let on = AugmentConfig::default_on();
+        assert!(on.enable);
+        assert!(on.shift && on.volume);
+        assert!(!on.noise && !on.stretch);
+    }
+
+    /// 时移 ±100ms 产生两个变体，长度不变
+    #[test]
+    fn augment_shift_produces_two_offsets() {
+        let slice: Vec<f64> = (0..44100).map(|i| (i as f64).sin()).collect();
+        let cfg = AugmentConfig::default_with(true, false, false, false);
+        let out = augment_sample(&slice, &cfg, 42, 0);
+        assert_eq!(out.len(), 3); // 原始 + +100ms + -100ms
+        for v in &out {
+            assert_eq!(v.len(), slice.len());
+        }
+        // +100ms 第一个非零值应该在 shift_samples 之后
+        let shift = (SEG_SR as f64 * 0.1).round() as usize;
+        let first_nonzero_after_shift = out[1][shift..]
+            .iter()
+            .enumerate()
+            .find(|(_, &v)| v != 0.0)
+            .map(|(i, _)| i);
+        assert!(first_nonzero_after_shift.is_some());
+    }
+
+    /// 音量 ±2dB 变体的 RMS 比值
+    #[test]
+    fn augment_volume_adjusts_rms() {
+        let slice: Vec<f64> = vec![0.5; 1000]; // 常数信号
+        let cfg = AugmentConfig::default_with(false, true, false, false);
+        let out = augment_sample(&slice, &cfg, 42, 0);
+        assert_eq!(out.len(), 3); // 原始 + plus + minus
+
+        let rms = |sig: &[f64]| (sig.iter().map(|x| x * x).sum::<f64>() / sig.len() as f64).sqrt();
+        let base_rms = rms(&out[0]);
+        let plus_rms = rms(&out[1]);
+        let minus_rms = rms(&out[2]);
+        // ±2dB：精确比值 10^(±2/20) ≈ 1.2589 / 0.7943
+        let expected_plus = 10.0f64.powf(2.0 / 20.0);
+        let expected_minus = 10.0f64.powf(-2.0 / 20.0);
+        assert!((plus_rms / base_rms - expected_plus).abs() < 1e-9);
+        assert!((minus_rms / base_rms - expected_minus).abs() < 1e-9);
+    }
+
+    /// 时间拉伸改变长度，值用线性插值
+    #[test]
+    fn augment_stretch_changes_length() {
+        let slice: Vec<f64> = (0..100)
+            .map(|i| if i % 2 == 0 { 1.0 } else { 0.0 })
+            .collect();
+        let cfg = AugmentConfig::default_with(false, false, false, true);
+        let out = augment_sample(&slice, &cfg, 42, 0);
+        assert_eq!(out.len(), 3); // 原始 + 0.9× + 1.1×
+                                  // 0.9× → 90 个点，1.1× → 110 个点
+        assert_eq!(out[1].len(), 90);
+        assert_eq!(out[2].len(), 110);
+        // 第一个点等于原始第一个点（比例插值边界）
+        assert!((out[1][0] - slice[0]).abs() < 1e-9);
+    }
+
+    /// 白噪变体：相同 seed_base + sample_idx 产生相同输出
+    #[test]
+    fn augment_noise_deterministic() {
+        let slice: Vec<f64> = vec![0.1; 500];
+        let cfg = AugmentConfig::default_with(false, false, true, false);
+        let a = augment_sample(&slice, &cfg, 99, 7);
+        let b = augment_sample(&slice, &cfg, 99, 7);
+        assert_eq!(a, b, "同 seed + 同 sample_idx 应产出完全相同的白噪变体");
+        assert_eq!(a.len(), 2); // 原始 + 白噪
+
+        // 换 sample_idx → 不同输出
+        let c = augment_sample(&slice, &cfg, 99, 8);
+        assert_ne!(a.last().unwrap(), c.last().unwrap());
+    }
+
+    /// 全部开启：原始 + shift×2 + volume×2 + noise×1 + stretch×2 = 8 变体
+    #[test]
+    fn augment_all_configs() {
+        let slice: Vec<f64> = (0..SEG_SR).map(|i| (i as f64).sin()).collect();
+        let cfg = AugmentConfig::default_with(true, true, true, true);
+        let out = augment_sample(&slice, &cfg, 0, 0);
+        assert_eq!(out.len(), 8);
     }
 }

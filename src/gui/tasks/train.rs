@@ -191,7 +191,13 @@ fn run_training(
         }
     };
 
-    match train_model(samples, &config, &path, on_progress) {
+    match train_model(
+        samples,
+        &config,
+        &path,
+        on_progress,
+        &crate::training::AugmentConfig::default(),
+    ) {
         Ok(report) => {
             let mut s = state.lock().unwrap();
             s.progress = 1.0;
