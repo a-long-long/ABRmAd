@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use crate::audio::{cache, ffmpeg};
 use crate::core::dsp::features::{self, AudioFeatures};
 use crate::core::dsp::fft::{self, FFT_LEN};
-use crate::core::dsp::separation;
+use crate::core::dsp::separation::{self, HpssParams};
 use crate::core::matching::lsh;
 use crate::core::range::{Link, Range};
 
@@ -41,6 +41,8 @@ pub struct DetectOptions {
     /// 是否启用 HPSS 源分离（分离打击乐轨道后再做检测）
     /// 对带背景音乐的广告段，打击乐轨道匹配更稳定。
     pub enable_hpss: bool,
+    /// HPSS 分离参数；None 时用默认值（harmonic=17, percussive=11）
+    pub hpss_params: Option<HpssParams>,
 }
 
 impl DetectOptions {
@@ -49,6 +51,11 @@ impl DetectOptions {
     }
     pub fn with_hpss(mut self) -> Self {
         self.enable_hpss = true;
+        self
+    }
+    pub fn with_hpss_params(mut self, params: HpssParams) -> Self {
+        self.enable_hpss = true;
+        self.hpss_params = Some(params);
         self
     }
 }
@@ -128,6 +135,11 @@ where
                     ffmpeg::audio_to_wav(mp3_path, &wav_path)?;
                 }
 
+                // 确定实际使用的 HPSS 参数（None 时用默认值）
+                let hpss_params = opts.hpss_params.as_ref().cloned().unwrap_or_default();
+                hpss_params.validate()?;
+                let cache_hash = hpss_params.cache_hash();
+
                 on_progress(
                     idx as f32 / num_files as f32,
                     &format!("HPSS 分离中 {}/{}: {}", idx + 1, num_files, file_name),
@@ -135,10 +147,10 @@ where
 
                 // 读原始采样 → HPSS 打击乐 → 写临时 WAV
                 let raw = fft::read_wav_samples(&wav_path)?;
-                let perc = separation::separate_percussive(&raw)?;
-                // 文件名加 pid + 时间戳 + 随机，避免多进程/并发运行冲突，崩溃后残留也不会互相覆盖
+                let perc = separation::separate_percussive_with_params(&raw, &hpss_params)?;
+                // 文件名加 cache_hash + pid + 时间戳 + 随机，params 变化自动隔离
                 let tmp_wav = std::env::temp_dir().join(format!(
-                    "abrmad_hpss_{}_{}_{}_{}.wav",
+                    "abrmad_hpss_{cache_hash}_{}_{}_{}_{}.wav",
                     std::process::id(),
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)

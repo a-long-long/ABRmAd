@@ -10,6 +10,7 @@ use crate::audio::ffmpeg;
 use crate::core::classify::model::load_model;
 use crate::core::classify::{classify_file_with_progress, ClassifyOptions};
 use crate::core::detect::{detect_ad_with_progress, DetectOptions};
+use crate::core::dsp::separation::HpssParams;
 use crate::core::range::Range;
 use crate::training::{TrainConfig, TrainSample};
 use crate::{pipeline, result_io};
@@ -38,6 +39,16 @@ enum Commands {
         /// 启用 HPSS 打击乐轨道源分离（对带背景音乐的广告段更稳定）
         #[arg(long)]
         hpss: bool,
+
+        /// HPSS 谐波方向中值滤波窗口（奇数，范围 3..=1001，默认 17）。
+        /// 仅在启用 --hpss 时生效。
+        #[arg(long, requires = "hpss")]
+        hpss_harm_window: Option<usize>,
+
+        /// HPSS 打击乐方向中值滤波窗口（奇数，范围 3..=1001，默认 11）。
+        /// 仅在启用 --hpss 时生效。
+        #[arg(long, requires = "hpss")]
+        hpss_perc_window: Option<usize>,
     },
 
     /// 裁剪音频文件（根据检测结果）
@@ -109,7 +120,15 @@ pub fn run() -> Result<()> {
             files,
             output,
             hpss,
-        } => cmd_detect(&files, output.as_ref(), hpss),
+            hpss_harm_window,
+            hpss_perc_window,
+        } => cmd_detect(
+            &files,
+            output.as_ref(),
+            hpss,
+            hpss_harm_window,
+            hpss_perc_window,
+        ),
         Commands::Cut {
             input_dir,
             output_dir,
@@ -138,11 +157,41 @@ pub fn run() -> Result<()> {
     }
 }
 
-fn cmd_detect(files: &[PathBuf], output: Option<&PathBuf>, hpss: bool) -> Result<()> {
+fn cmd_detect(
+    files: &[PathBuf],
+    output: Option<&PathBuf>,
+    hpss: bool,
+    hpss_harm_window: Option<usize>,
+    hpss_perc_window: Option<usize>,
+) -> Result<()> {
     println!("开始检测广告...");
     println!("输入文件数量: {}", files.len());
     if hpss {
-        println!("HPSS 分离: 开启");
+        let params = match (hpss_harm_window, hpss_perc_window) {
+            (Some(hw), Some(pw)) => {
+                let p = HpssParams::new(hw, pw);
+                p.validate().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                Some(p)
+            }
+            (Some(hw), None) => {
+                let p = HpssParams::new(hw, HpssParams::default().percussive_window);
+                p.validate().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                Some(p)
+            }
+            (None, Some(pw)) => {
+                let p = HpssParams::new(HpssParams::default().harmonic_window, pw);
+                p.validate().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                Some(p)
+            }
+            (None, None) => None,
+        };
+        match &params {
+            Some(p) => println!(
+                "HPSS 分离: 开启 (harmonic_window={}, percussive_window={})",
+                p.harmonic_window, p.percussive_window
+            ),
+            None => println!("HPSS 分离: 开启"),
+        }
     }
 
     for f in files {
@@ -152,7 +201,12 @@ fn cmd_detect(files: &[PathBuf], output: Option<&PathBuf>, hpss: bool) -> Result
     }
 
     let opts = if hpss {
-        DetectOptions::default().with_hpss()
+        match (hpss_harm_window, hpss_perc_window) {
+            (Some(hw), Some(pw)) => {
+                DetectOptions::default().with_hpss_params(HpssParams::new(hw, pw))
+            }
+            _ => DetectOptions::default().with_hpss(),
+        }
     } else {
         DetectOptions::default()
     };

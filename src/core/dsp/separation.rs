@@ -21,8 +21,16 @@ pub struct HpssParams {
     pub harmonic_window: usize,
     /// 频率方向中值窗口（奇数 bin），越大保留越少音调 → 越纯打击乐
     pub percussive_window: usize,
-    /// 防除零常数
+    /// 防除零常数（参与算法但不影响缓存隔离）
     pub epsilon: f64,
+}
+
+impl std::hash::Hash for HpssParams {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.harmonic_window.hash(state);
+        self.percussive_window.hash(state);
+        // epsilon 是算法常数，不影响行为，不参与 Hash
+    }
 }
 
 impl Default for HpssParams {
@@ -42,6 +50,32 @@ impl HpssParams {
             percussive_window: pw.max(3) | 1,
             epsilon: 1e-8,
         }
+    }
+
+    /// 窗口参数合法性校验
+    pub fn validate(&self) -> Result<()> {
+        for (label, v) in [
+            ("harmonic_window", self.harmonic_window),
+            ("percussive_window", self.percussive_window),
+        ] {
+            if v < 3 || v > 1001 {
+                bail!("{label} 应在 3..=1001 范围内");
+            }
+            if v % 2 == 0 {
+                bail!("{label} 必须为奇数");
+            }
+        }
+        Ok(())
+    }
+
+    /// 用于缓存隔离的稳定哈希（只计入影响算法行为的窗口参数，
+    /// epsilon 是算法常数不参与，避免不同 f64 字面量导致的碰撞）
+    pub fn cache_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.harmonic_window.hash(&mut h);
+        self.percussive_window.hash(&mut h);
+        h.finish()
     }
 }
 
@@ -271,15 +305,23 @@ pub fn hpss_separate(
 
 /// 便捷入口：用默认参数分离打击乐轨道（给检测用）
 pub fn separate_percussive(samples: &[f64]) -> Result<Vec<f64>> {
-    let params = HpssParams::default();
-    let (_, perc) = hpss_separate(samples, &params, HPSS_N_FFT, HPSS_HOP)?;
+    separate_percussive_with_params(samples, &HpssParams::default())
+}
+
+/// 便捷入口：用指定参数分离打击乐轨道
+pub fn separate_percussive_with_params(samples: &[f64], params: &HpssParams) -> Result<Vec<f64>> {
+    let (_, perc) = hpss_separate(samples, params, HPSS_N_FFT, HPSS_HOP)?;
     Ok(perc)
 }
 
 /// 便捷入口：用默认参数分离谐波轨道（给检测用）
 pub fn separate_harmonic(samples: &[f64]) -> Result<Vec<f64>> {
-    let params = HpssParams::default();
-    let (harm, _) = hpss_separate(samples, &params, HPSS_N_FFT, HPSS_HOP)?;
+    separate_harmonic_with_params(samples, &HpssParams::default())
+}
+
+/// 便捷入口：用指定参数分离谐波轨道
+pub fn separate_harmonic_with_params(samples: &[f64], params: &HpssParams) -> Result<Vec<f64>> {
+    let (harm, _) = hpss_separate(samples, params, HPSS_N_FFT, HPSS_HOP)?;
     Ok(harm)
 }
 
@@ -335,6 +377,86 @@ mod tests {
         assert!(
             ratio > 1.2,
             "harmonic should dominate: e_h={e_h:.4}, e_p={e_p:.4}, ratio={ratio:.2}"
+        );
+    }
+
+    #[test]
+    fn test_separate_percussive_default_equals_with_params() {
+        let sr = HPSS_SR as usize;
+        let n = sr * 2; // 2 秒
+        let mut sig = vec![0.0f64; n];
+        for i in 0..n {
+            sig[i] = 0.5 * (2.0 * PI * 440.0 * i as f64 / sr as f64).sin();
+        }
+        let a = separate_percussive(&sig).unwrap();
+        let b = separate_percussive_with_params(&sig, &HpssParams::default()).unwrap();
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < 1e-10, "逐样本 diff 超过 1e-10");
+        }
+    }
+
+    #[test]
+    fn test_hpss_params_validate() {
+        // 默认值应合法
+        HpssParams::default().validate().unwrap();
+        // new() 会自动奇数化 + 下限 3
+        HpssParams::new(2, 2).validate().unwrap(); // 变成 (3, 3)
+                                                   // 非法：偶数
+        assert!(HpssParams {
+            harmonic_window: 18,
+            percussive_window: 11,
+            epsilon: 1e-8
+        }
+        .validate()
+        .is_err());
+        // 非法：超上限
+        assert!(HpssParams {
+            harmonic_window: 1003,
+            percussive_window: 11,
+            epsilon: 1e-8
+        }
+        .validate()
+        .is_err());
+        // 非法：低于下限
+        assert!(HpssParams {
+            harmonic_window: 1,
+            percussive_window: 11,
+            epsilon: 1e-8
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn test_hpss_params_cache_hash() {
+        // 不同窗口参数 → 不同 hash
+        let a = HpssParams::new(17, 11);
+        let b = HpssParams::new(25, 15);
+        assert_ne!(a.cache_hash(), b.cache_hash());
+        // 相同窗口参数（不管 epsilon）→ 相同 hash
+        let c = HpssParams::new(17, 11);
+        let mut d = HpssParams::new(17, 11);
+        d.epsilon = 1e-6; // 改 epsilon 不影响 cache_hash
+        assert_eq!(c.cache_hash(), d.cache_hash());
+    }
+
+    #[test]
+    fn test_different_hpss_params_produce_different_output() {
+        let sr = HPSS_SR as usize;
+        let n = sr * 2;
+        let mut sig = vec![0.0f64; n];
+        for i in 0..n {
+            sig[i] = 0.5 * (2.0 * PI * 440.0 * i as f64 / sr as f64).sin();
+        }
+        // 窄窗口 (11, 7) vs 宽窗口 (25, 15) 应产生明显不同的打击乐轨道
+        let a = separate_percussive_with_params(&sig, &HpssParams::new(11, 7)).unwrap();
+        let b = separate_percussive_with_params(&sig, &HpssParams::new(25, 15)).unwrap();
+        let energy_diff =
+            (a.iter().map(|x| x * x).sum::<f64>() - b.iter().map(|x| x * x).sum::<f64>()).abs();
+        assert!(
+            energy_diff > 1e-6,
+            "不同 HPSS 参数应产生不同输出，能量差为 {energy_diff}"
         );
     }
 }
