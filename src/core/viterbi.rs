@@ -57,8 +57,8 @@ pub fn viterbi_filter(candidates: &[Candidate], config: &ViterbiConfig) -> Vec<C
 
     // 大候选集：按 pos1-pos2 偏移量分桶，前驱只在偏移接近的桶内查找
     let buckets = build_offset_buckets(candidates, &order);
-    run_chain(candidates, &order, config, |k| {
-        bucket_predecessors(candidates, &order, &buckets, k, config)
+    run_chain(candidates, &order, config, |k, dp| {
+        bucket_best_predecessor(candidates, &order, &buckets, k, config, dp)
     })
 }
 
@@ -68,20 +68,27 @@ fn viterbi_filter_naive(
     order: &[usize],
     config: &ViterbiConfig,
 ) -> Vec<Candidate> {
-    run_chain(candidates, order, config, |k| {
-        naive_predecessors(candidates, order, k, config)
+    run_chain(candidates, order, config, |k, dp| {
+        naive_best_predecessor(candidates, order, k, config, dp)
     })
 }
 
-/// 公共 DP 主体：`preds_for(k)` 需按 order 下标降序返回 k 的全部合法前驱
+/// 公共 DP 主体
+///
+/// `best_pred(k, dp)` 返回 k 的最优前驱在 `order` 中的下标，
+/// None 表示没有可用前驱（k 作为链起点）。
+///
+/// 等价于原实现：`dp[k] = score[k] + max(dp[m])`，其中并列最优取
+/// **order 下标最大**的前驱（原实现先按 order 下标降序展开前驱，再用
+/// 严格 `>` 比较，因此并列时第一个命中的是最大下标）。
 fn run_chain<F>(
     candidates: &[Candidate],
     order: &[usize],
     config: &ViterbiConfig,
-    preds_for: F,
+    best_pred: F,
 ) -> Vec<Candidate>
 where
-    F: Fn(usize) -> Vec<usize>,
+    F: Fn(usize, &[f64]) -> Option<usize>,
 {
     let n = order.len();
     // dp[k] = 以 order[k] 结尾的最佳链得分
@@ -96,22 +103,28 @@ where
         dp[k] = ci.score;
         chain_len[k] = 1;
 
-        for m in preds_for(k) {
-            let new_score = dp[m] + ci.score;
-            if new_score > dp[k] {
-                dp[k] = new_score;
-                parent[k] = Some(m);
-                chain_len[k] = chain_len[m] + 1;
-            }
+        if let Some(m) = best_pred(k, &dp) {
+            dp[k] = dp[m] + ci.score;
+            parent[k] = Some(m);
+            chain_len[k] = chain_len[m] + 1;
         }
     }
 
     // 回溯标记：找出所有属于合格链的候选
+    //
+    // 若 k 已标记，说明它的整条祖先链此前已全部标记，无需重复回溯。
+    // 缺了这一步，长链场景下每个合格候选都要回溯到链首，退化为 O(n²)。
     let mut keep = vec![false; n];
     for k in 0..n {
+        if keep[k] {
+            continue;
+        }
         if dp[k] >= config.min_chain_score && chain_len[k] >= config.min_chain_length {
             let mut cur = Some(k);
             while let Some(c) = cur {
+                if keep[c] {
+                    break;
+                }
                 keep[c] = true;
                 cur = parent[c];
             }
@@ -127,15 +140,23 @@ where
         .collect()
 }
 
-/// 线性扫描前驱（原始实现），按 order 下标降序返回
-fn naive_predecessors(
+/// 线性扫描最优前驱（原始 O(n²) 路径）
+///
+/// 从后向前扫描（等价于原实现"按 order 下标降序展开前驱"），
+/// 用严格 `>` 更新，因此并列最优时保留**最大下标**。
+fn naive_best_predecessor(
     candidates: &[Candidate],
     order: &[usize],
     k: usize,
     config: &ViterbiConfig,
-) -> Vec<usize> {
+    dp: &[f64],
+) -> Option<usize> {
     let ci = candidates[order[k]];
-    let mut preds = Vec::new();
+    // 与 dp[k] 的初值对应：原实现 `new_score > dp[k]`（dp[k] 初始 = score[k]），
+    // 等价于 `dp[m] > best_val`，初值 0.0
+    let mut best_val = 0.0f64;
+    let mut best: Option<usize> = None;
+
     for m in (0..k).rev() {
         let cm = candidates[order[m]];
 
@@ -149,11 +170,12 @@ fn naive_predecessors(
         let delta2 = ci.pos2 as isize - cm.pos2 as isize;
         let drift = (delta1 - delta2).unsigned_abs();
 
-        if drift <= config.max_drift && delta1 > 0 {
-            preds.push(m);
+        if drift <= config.max_drift && delta1 > 0 && dp[m] > best_val {
+            best_val = dp[m];
+            best = Some(m);
         }
     }
-    preds
+    best
 }
 
 /// 按偏移量（pos1 - pos2）分桶；桶内按 order 下标升序，等价于按 pos1 升序
@@ -173,38 +195,168 @@ fn build_offset_buckets(
     buckets
 }
 
-/// 桶内前驱查找：偏移差 ≤ max_drift 且 pos1 落在 lookback 窗口内
-fn bucket_predecessors(
+/// 桶内最优前驱查找：偏移差 ≤ max_drift 且 pos1 落在 lookback 窗口内
+///
+/// 各桶内候选按 pos1（即 order 下标）升序排列。桶内用 `>=` 更新，
+/// 使并列最优保留**桶内最大下标**；跨桶合并时显式比较下标，保证
+/// 与"全局按 order 下标降序 + 严格 `>`"的语义完全一致。
+fn bucket_best_predecessor(
     candidates: &[Candidate],
     order: &[usize],
     buckets: &std::collections::HashMap<isize, Vec<usize>>,
     k: usize,
     config: &ViterbiConfig,
-) -> Vec<usize> {
+    dp: &[f64],
+) -> Option<usize> {
     let ci = candidates[order[k]];
     let offset = ci.pos1 as isize - ci.pos2 as isize;
     let lo = ci.pos1.saturating_sub(config.max_lookback);
     // delta1 > 0，即前驱 pos1 必须严格小于当前 pos1
     let hi = ci.pos1;
 
-    let mut preds = Vec::new();
+    let mut best_val = 0.0f64;
+    let mut best: Option<usize> = None;
     let drift = config.max_drift as isize;
+
     for target in (offset - drift)..=(offset + drift) {
         let Some(bucket) = buckets.get(&target) else {
             continue;
         };
         let start = bucket.partition_point(|&m| candidates[order[m]].pos1 < lo);
         let end = bucket.partition_point(|&m| candidates[order[m]].pos1 < hi);
-        preds.extend_from_slice(&bucket[start..end]);
+
+        // 桶内升序：用 >= 让并列最优保留最大下标
+        let mut bucket_val = 0.0f64;
+        let mut bucket_idx: Option<usize> = None;
+        for &m in &bucket[start..end] {
+            if dp[m] >= bucket_val && dp[m] > 0.0 {
+                bucket_val = dp[m];
+                bucket_idx = Some(m);
+            }
+        }
+
+        // 跨桶合并：值更大，或值相等且下标更大
+        if let Some(m) = bucket_idx {
+            let better = match best {
+                None => true,
+                Some(bm) => bucket_val > best_val || (bucket_val == best_val && m > bm),
+            };
+            if better {
+                best_val = bucket_val;
+                best = Some(m);
+            }
+        }
     }
-    // 与线性扫描一致：按 order 下标降序处理，保证并列最优时选到同一个前驱
-    preds.sort_unstable_by(|a, b| b.cmp(a));
-    preds
+    best
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 参考实现：逐字复刻重构前的旧逻辑
+    ///
+    /// 旧实现按 order 下标降序展开全部前驱，再用严格 `>` 更新 dp，
+    /// 因此并列最优时选到的是**最大 order 下标**。此函数用于确保
+    /// 优化后的实现与之逐元素等价。
+    fn reference_viterbi(candidates: &[Candidate], config: &ViterbiConfig) -> Vec<Candidate> {
+        let n = candidates.len();
+        if n < config.min_chain_length {
+            return Vec::new();
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| candidates[i].pos1);
+
+        let mut dp = vec![0.0f64; n];
+        let mut parent: Vec<Option<usize>> = vec![None; n];
+        let mut chain_len = vec![0usize; n];
+
+        for k in 0..n {
+            let ci = candidates[order[k]];
+            dp[k] = ci.score;
+            chain_len[k] = 1;
+
+            let mut preds = Vec::new();
+            for m in (0..k).rev() {
+                let cm = candidates[order[m]];
+                if ci.pos1 - cm.pos1 > config.max_lookback {
+                    break;
+                }
+                let delta1 = ci.pos1 as isize - cm.pos1 as isize;
+                let delta2 = ci.pos2 as isize - cm.pos2 as isize;
+                if (delta1 - delta2).unsigned_abs() <= config.max_drift && delta1 > 0 {
+                    preds.push(m);
+                }
+            }
+            // 旧实现：preds 已按 order 下标降序（上面是从后往前收集）
+            for m in preds {
+                let new_score = dp[m] + ci.score;
+                if new_score > dp[k] {
+                    dp[k] = new_score;
+                    parent[k] = Some(m);
+                    chain_len[k] = chain_len[m] + 1;
+                }
+            }
+        }
+
+        let mut keep = vec![false; n];
+        for k in 0..n {
+            if dp[k] >= config.min_chain_score && chain_len[k] >= config.min_chain_length {
+                let mut cur = Some(k);
+                while let Some(c) = cur {
+                    keep[c] = true;
+                    cur = parent[c];
+                }
+            }
+        }
+
+        order
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| keep[*k])
+            .map(|(_, &orig_idx)| candidates[orig_idx])
+            .collect()
+    }
+
+    /// 在大量**平分**（相同 score → 相同 dp）的数据上，
+    /// 优化实现必须与旧实现选出完全相同的候选集合
+    #[test]
+    fn optimized_matches_reference_with_ties() {
+        use rand::seq::SliceRandom;
+        use rand::{Rng, SeedableRng};
+
+        for seed in 0..8u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut candidates = Vec::new();
+            for i in 0..4000usize {
+                let pos1 = i * 2 + rng.gen_range(0..2);
+                // 只有 3 种偏移 → 每个候选都有多个等距前驱，制造大量并列
+                let offset = rng.gen_range(0..3);
+                let pos2 = pos1.saturating_sub(offset);
+                // 只有 2 种分数 → dp 大量并列
+                let score = if rng.gen_bool(0.5) { 0.7 } else { 1.0 };
+                candidates.push(Candidate { pos1, pos2, score });
+            }
+            candidates.shuffle(&mut rng);
+
+            let config = ViterbiConfig {
+                max_drift: 3,
+                max_lookback: 40,
+                min_chain_score: 2.0,
+                min_chain_length: 2,
+            };
+
+            let expected = reference_viterbi(&candidates, &config);
+            let actual = viterbi_filter(&candidates, &config);
+
+            let key = |c: &Candidate| (c.pos1, c.pos2);
+            assert_eq!(
+                expected.iter().map(key).collect::<Vec<_>>(),
+                actual.iter().map(key).collect::<Vec<_>>(),
+                "seed {seed}: optimized result must equal reference implementation"
+            );
+        }
+    }
 
     #[test]
     fn test_consistent_chain() {
