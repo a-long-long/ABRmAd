@@ -171,7 +171,11 @@ mod imp {
         queue: wgpu::Queue,
         pipeline: wgpu::ComputePipeline,
         bind_group_layout: wgpu::BindGroupLayout,
+        hash_histogram_pipeline: wgpu::ComputePipeline,
+        hash_bucket_scan_pipeline: wgpu::ComputePipeline,
+        hash_sort_pipeline: wgpu::ComputePipeline,
         hash_count_pipeline: wgpu::ComputePipeline,
+        hash_offsets_scan_pipeline: wgpu::ComputePipeline,
         hash_scatter_pipeline: wgpu::ComputePipeline,
         hash_bind_group_layout: wgpu::BindGroupLayout,
         fused_pipeline: wgpu::ComputePipeline,
@@ -283,11 +287,13 @@ mod imp {
                         },
                         count: None,
                     },
-                    storage_entry(1, false),
-                    storage_entry(2, false),
-                    storage_entry(3, false),
-                    storage_entry(4, true),
-                    storage_entry(5, true),
+                    storage_entry(1, false), // hash1（采样后的探针基值）
+                    storage_entry(2, false), // hash2（原始，含 VAD 标记）
+                    storage_entry(3, true),  // bucket：直方图 → 桶起始偏移
+                    storage_entry(4, true),  // cursor：计数排序的写游标
+                    storage_entry(5, true),  // sorted_pos：按 hash 稳定排序后的位置
+                    storage_entry(6, true),  // counts：(帧,探针) 匹配数 → 前缀和偏移
+                    storage_entry(7, true),  // out_pairs：(帧槽, 位置)
                 ],
             });
         let hash_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -295,22 +301,24 @@ mod imp {
             bind_group_layouts: &[&hash_bind_group_layout],
             push_constant_ranges: &[],
         });
-        let hash_count_pipeline =
+        let make_hash_pipeline = |label: &str, entry: &str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("hash_count_pipeline"),
+                label: Some(label),
                 layout: Some(&hash_layout),
                 module: &hash_shader,
-                entry_point: "count_main",
+                entry_point: entry,
                 compilation_options: Default::default(),
-            });
-        let hash_scatter_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("hash_scatter_pipeline"),
-                layout: Some(&hash_layout),
-                module: &hash_shader,
-                entry_point: "scatter_main",
-                compilation_options: Default::default(),
-            });
+            })
+        };
+        let hash_histogram_pipeline =
+            make_hash_pipeline("hash_histogram_pipeline", "histogram_main");
+        let hash_bucket_scan_pipeline =
+            make_hash_pipeline("hash_bucket_scan_pipeline", "bucket_scan_main");
+        let hash_sort_pipeline = make_hash_pipeline("hash_sort_pipeline", "sort_main");
+        let hash_count_pipeline = make_hash_pipeline("hash_count_pipeline", "count_main");
+        let hash_offsets_scan_pipeline =
+            make_hash_pipeline("hash_offsets_scan_pipeline", "offsets_scan_main");
+        let hash_scatter_pipeline = make_hash_pipeline("hash_scatter_pipeline", "scatter_main");
 
         // 三特征融合：一次 dispatch 内完成 3 路余弦相似度并加权求和
         let fused_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -357,7 +365,11 @@ mod imp {
             queue,
             pipeline,
             bind_group_layout,
+            hash_histogram_pipeline,
+            hash_bucket_scan_pipeline,
+            hash_sort_pipeline,
             hash_count_pipeline,
+            hash_offsets_scan_pipeline,
             hash_scatter_pipeline,
             hash_bind_group_layout,
             fused_pipeline,
@@ -969,6 +981,41 @@ mod imp {
         }
     }
 
+    /// 只回读源缓冲中偏移 `elem` 处的一个 u32（例如前缀和末尾的总数）
+    fn read_u32_at(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src: &wgpu::Buffer,
+        elem: usize,
+    ) -> Option<u32> {
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hf_total_staging"),
+            size: 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("hf_total_readback"),
+        });
+        encoder.copy_buffer_to_buffer(src, (elem * 4) as u64, &staging, 0, 4);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv().ok()?.ok()?;
+
+        let data = slice.get_mapped_range();
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&data[0..4]);
+        drop(data);
+        staging.unmap();
+        Some(u32::from_ne_bytes(bytes))
+    }
+
     /// 从 GPU buffer 读回全部数据
     fn read_buffer<T: bytemuck::Pod>(
         device: &wgpu::Device,
@@ -1029,26 +1076,15 @@ mod imp {
             return None;
         }
 
-        // (hash, pos) 字典序排序：同 hash 内 pos 升序，与 CPU HashMap 的
-        // 插入顺序一致，保证组内位置顺序相同
-        let mut indexed: Vec<(i32, u32)> = hash2
-            .iter()
-            .enumerate()
-            .filter(|(_, &h)| h != crate::core::matching::lsh::VAD_SILENCE_MARKER)
-            .map(|(i, &h)| (h, i as u32))
-            .collect();
-        indexed.sort_unstable();
-        let sorted_hash2: Vec<i32> = indexed.iter().map(|&(h, _)| h).collect();
-        let sorted_pos2: Vec<u32> = indexed.iter().map(|&(_, p)| p).collect();
-
         let backend = backend()?;
         let device = &backend.device;
         let queue = &backend.queue;
 
+        let n2 = hash2.len();
         let n1 = sampled.len();
         let total_probes = n1.checked_mul(PROBES_PER_FRAME)?;
         let params = HashParams {
-            n2: hash2.len() as u32,
+            n2: n2 as u32,
             total_probes: total_probes as u32,
             _pad0: 0,
             _pad1: 0,
@@ -1056,8 +1092,7 @@ mod imp {
 
         let hash1_data: Vec<i32> = sampled.iter().map(|&(_, h)| h).collect();
         let hash1_buf = create_storage(device, "hf_hash1", bytemuck::cast_slice(&hash1_data));
-        let hash2_buf = create_storage(device, "hf_hash2", bytemuck::cast_slice(&sorted_hash2));
-        let pos2_buf = create_storage(device, "hf_pos2", bytemuck::cast_slice(&sorted_pos2));
+        let hash2_buf = create_storage(device, "hf_hash2", bytemuck::cast_slice(hash2));
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("hf_params"),
             size: std::mem::size_of::<HashParams>() as u64,
@@ -1066,8 +1101,29 @@ mod imp {
         });
         queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params));
 
-        // counts buffer：pass1 写匹配数，CPU prefix sum 后写回作为 scatter 偏移
-        let counts_size = (total_probes * std::mem::size_of::<u32>()) as u64;
+        // bucket/cursor 覆盖 0..65535 全部 16 位哈希 + 末尾总数槽
+        const BUCKET_SLOTS: usize = 65_537;
+        let zeros = vec![0u8; BUCKET_SLOTS * std::mem::size_of::<u32>()];
+        // bucket 需要作为 copy 源（扫描后复制给 cursor），故额外带 COPY_SRC
+        let bucket_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hf_bucket"),
+            size: zeros.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        bucket_buf.slice(..).get_mapped_range_mut()[..zeros.len()].copy_from_slice(&zeros);
+        bucket_buf.unmap();
+        let cursor_buf = create_storage(device, "hf_cursor", &zeros);
+        let sorted_pos_buf = create_storage(
+            device,
+            "hf_sorted_pos",
+            &vec![0u8; n2.max(1) * std::mem::size_of::<u32>()],
+        );
+
+        // counts：total_probes 个前缀偏移 + 末尾一个总输出数
+        let counts_size = ((total_probes + 1) * std::mem::size_of::<u32>()) as u64;
         let counts_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("hf_counts"),
             size: counts_size,
@@ -1076,7 +1132,7 @@ mod imp {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // pass1 不需要真正的输出 buffer，先绑定 dummy
+        // 前几趟用不到 out_pairs，先绑定 dummy
         let dummy_out = create_storage(device, "hf_dummy", &[0u8; 8]);
 
         let make_bind_group = |out: &wgpu::Buffer| {
@@ -1098,58 +1154,76 @@ mod imp {
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: pos2_buf.as_entire_binding(),
+                        resource: bucket_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: counts_buf.as_entire_binding(),
+                        resource: cursor_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
+                        resource: sorted_pos_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: counts_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
                         resource: out.as_entire_binding(),
                     },
                 ],
             })
         };
 
-        let workgroups = (total_probes as u32 + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        let workgroups = (total_probes as u32).div_ceil(WORKGROUP_SIZE);
 
-        // Pass 1：统计每个 (帧, 探针) 的匹配数
+        // 第一段（单次提交、顺序执行）：
+        // 直方图 → 桶前缀和 → cursor 复制 → 稳定计数排序 → 每(帧,探针)匹配数 → 偏移前缀和
         {
             let bg = make_bind_group(&dummy_out);
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("hf_count"),
+                label: Some("hf_prepare"),
             });
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("hf_count_pass"),
+                    label: Some("hf_prepare_pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&backend.hash_count_pipeline);
                 pass.set_bind_group(0, &bg, &[]);
+                pass.set_pipeline(&backend.hash_histogram_pipeline);
+                pass.dispatch_workgroups(1, 1, 1);
+                pass.set_pipeline(&backend.hash_bucket_scan_pipeline);
+                pass.dispatch_workgroups(1, 1, 1);
+                pass.set_pipeline(&backend.hash_count_pipeline);
                 pass.dispatch_workgroups(workgroups, 1, 1);
+                pass.set_pipeline(&backend.hash_offsets_scan_pipeline);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            // 排序游标来自桶前缀和；排序必须在扫描之后
+            encoder.copy_buffer_to_buffer(&bucket_buf, 0, &cursor_buf, 0, zeros.len() as u64);
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("hf_sort_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_bind_group(0, &bg, &[]);
+                pass.set_pipeline(&backend.hash_sort_pipeline);
+                pass.dispatch_workgroups(1, 1, 1);
             }
             queue.submit(Some(encoder.finish()));
         }
 
-        let counts: Vec<u32> = read_buffer(device, queue, &counts_buf, total_probes)?;
-
-        // CPU prefix sum（exclusive），同时得到精确总输出大小
-        let mut total = 0usize;
-        let mut offsets: Vec<u32> = Vec::with_capacity(total_probes);
-        for &c in &counts {
-            offsets.push(total as u32);
-            total = total.checked_add(c as usize)?;
-            if total > MAX_HASH_FILTER_OUT {
-                return None;
-            }
-        }
+        // 只回读 1 个 u32：总输出配对数
+        let total = read_u32_at(device, queue, &counts_buf, total_probes)? as usize;
         if total == 0 {
             return Some(super::FlatGroups::empty());
         }
-        queue.write_buffer(&counts_buf, 0, bytemuck::cast_slice(&offsets));
+        if total > MAX_HASH_FILTER_OUT {
+            return None;
+        }
 
-        // Pass 2：按偏移 scatter 写入 (frame, pos)
+        // 第二段：按偏移 scatter 写入 (帧槽, 位置)
         let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("hf_out"),
             size: (total * std::mem::size_of::<[u32; 2]>()) as u64,
@@ -1175,7 +1249,7 @@ mod imp {
 
         let pairs: Vec<[u32; 2]> = read_buffer(device, queue, &out_buf, total)?;
 
-        // 直接组装扁平结构：跳过空组，组内位置已按 scatter 顺序升序
+        // 直接组装扁平结构：跳过空组；组内位置由稳定计数排序保证升序
         let mut flat = super::FlatGroups::empty();
         let mut idx = 0usize;
         for (frame, &(orig_i, _)) in sampled.iter().enumerate() {
@@ -1319,12 +1393,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-    /// hash filter：多探针 LSH 候选生成
+    /// hash filter：多探针 LSH 候选生成（全链 GPU）
     ///
-    /// 每个线程处理一个 (采样帧, 探针) 对。探针生成顺序与 CPU
-    /// `multi_probe_hashes_into` 完全一致：原始 hash → 单 bit 翻转
-    /// （bit 0..15）→ 双 bit 翻转（b1 0..15, b2 b1+1..16）。
-    /// 二分查找在排序后的 hash2 上定位匹配区间。
+    /// 探针生成顺序与 CPU `multi_probe_hashes_into` 完全一致：原始 hash →
+    /// 单 bit 翻转（bit 0..15）→ 双 bit 翻转（b1 0..15, b2 b1+1..16）。
+    ///
+    /// 与旧版“host 排序 + 二分查找”相比，本版在 GPU 内完成：
+    /// 16 位计数排序（稳定，桶内位置升序）→ 桶前缀和 → 每(帧,探针)计数 →
+    /// 偏移前缀和 → scatter。host 只上传原始 hash2、回读最终配对。
     pub(crate) const HASH_SHADER: &str = r#"
 struct HashParams {
     n2: u32,
@@ -1335,13 +1411,18 @@ struct HashParams {
 
 @group(0) @binding(0) var<uniform> params: HashParams;
 @group(0) @binding(1) var<storage, read> hash1: array<i32>;
-@group(0) @binding(2) var<storage, read> sorted_hash2: array<i32>;
-@group(0) @binding(3) var<storage, read> sorted_pos2: array<u32>;
-@group(0) @binding(4) var<storage, read_write> counts: array<u32>;
-@group(0) @binding(5) var<storage, read_write> out_pairs: array<vec2<u32>>;
+@group(0) @binding(2) var<storage, read> hash2: array<i32>;
+@group(0) @binding(3) var<storage, read_write> bucket: array<u32>;
+@group(0) @binding(4) var<storage, read_write> cursor: array<u32>;
+@group(0) @binding(5) var<storage, read_write> sorted_pos: array<u32>;
+@group(0) @binding(6) var<storage, read_write> counts: array<u32>;
+@group(0) @binding(7) var<storage, read_write> out_pairs: array<vec2<u32>>;
 
 const NUM_HASH_BITS: u32 = 16u;
+const NUM_BUCKETS: u32 = 65536u;
 const PROBES_PER_FRAME: u32 = 137u;
+// VAD 静音窗口的哨兵值（i32::MIN），不参与任何候选
+const VAD_MARKER: i32 = -2147483648;
 
 fn probe_hash(base: i32, probe_idx: u32) -> i32 {
     if (probe_idx == 0u) {
@@ -1363,32 +1444,48 @@ fn probe_hash(base: i32, probe_idx: u32) -> i32 {
     return base ^ (1i << b1) ^ (1i << b2);
 }
 
-fn lower_bound(h: i32) -> u32 {
-    var lo = 0u;
-    var hi = params.n2;
-    while (lo < hi) {
-        let mid = (lo + hi) / 2u;
-        if (sorted_hash2[mid] < h) {
-            lo = mid + 1u;
-        } else {
-            hi = mid;
-        }
-    }
-    return lo;
+fn bucket_index(h: i32) -> u32 {
+    return u32(h) & 0xFFFFu;
 }
 
-fn upper_bound(h: i32) -> u32 {
-    var lo = 0u;
-    var hi = params.n2;
-    while (lo < hi) {
-        let mid = (lo + hi) / 2u;
-        if (sorted_hash2[mid] <= h) {
-            lo = mid + 1u;
-        } else {
-            hi = mid;
+// 直方图：统计每个 16 位 hash 的非 VAD 元素数
+@compute @workgroup_size(1)
+fn histogram_main() {
+    for (var i = 0u; i < params.n2; i = i + 1u) {
+        let h = hash2[i];
+        if (h == VAD_MARKER) {
+            continue;
         }
+        let b = bucket_index(h);
+        bucket[b] = bucket[b] + 1u;
     }
-    return lo;
+}
+
+// 桶前缀和：bucket 原地变为 exclusive 起始偏移，末尾槽保存总数
+@compute @workgroup_size(1)
+fn bucket_scan_main() {
+    var acc = 0u;
+    for (var b = 0u; b < NUM_BUCKETS; b = b + 1u) {
+        let c = bucket[b];
+        bucket[b] = acc;
+        acc = acc + c;
+    }
+    bucket[NUM_BUCKETS] = acc;
+}
+
+// 稳定计数排序：按原始顺序写入桶内，同一桶内位置严格升序
+@compute @workgroup_size(1)
+fn sort_main() {
+    for (var k = 0u; k < params.n2; k = k + 1u) {
+        let h = hash2[k];
+        if (h == VAD_MARKER) {
+            continue;
+        }
+        let b = bucket_index(h);
+        let slot = cursor[b];
+        sorted_pos[slot] = k;
+        cursor[b] = slot + 1u;
+    }
 }
 
 @compute @workgroup_size(64)
@@ -1399,8 +1496,20 @@ fn count_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let frame = idx / PROBES_PER_FRAME;
     let probe_idx = idx % PROBES_PER_FRAME;
-    let h = probe_hash(hash1[frame], probe_idx);
-    counts[idx] = upper_bound(h) - lower_bound(h);
+    let b = bucket_index(probe_hash(hash1[frame], probe_idx));
+    counts[idx] = bucket[b + 1u] - bucket[b];
+}
+
+// 偏移前缀和：counts 原地变为 exclusive 偏移，末尾槽保存总配对数
+@compute @workgroup_size(1)
+fn offsets_scan_main() {
+    var acc = 0u;
+    for (var i = 0u; i < params.total_probes; i = i + 1u) {
+        let c = counts[i];
+        counts[i] = acc;
+        acc = acc + c;
+    }
+    counts[params.total_probes] = acc;
 }
 
 @compute @workgroup_size(64)
@@ -1411,13 +1520,13 @@ fn scatter_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let frame = idx / PROBES_PER_FRAME;
     let probe_idx = idx % PROBES_PER_FRAME;
-    let h = probe_hash(hash1[frame], probe_idx);
-    let lo = lower_bound(h);
-    let hi = upper_bound(h);
-    // counts buffer 此时已被 CPU 写回为 exclusive prefix sum 偏移
+    let b = bucket_index(probe_hash(hash1[frame], probe_idx));
+    let lo = bucket[b];
+    let hi = bucket[b + 1u];
+    // counts 此时已是 exclusive prefix sum 偏移
     var offset = counts[idx];
     for (var k = lo; k < hi; k = k + 1u) {
-        out_pairs[offset] = vec2<u32>(frame, sorted_pos2[k]);
+        out_pairs[offset] = vec2<u32>(frame, sorted_pos[k]);
         offset = offset + 1u;
     }
 }

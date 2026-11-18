@@ -445,8 +445,8 @@ mod tests {
 
 /// GPU hash_filter 算法的 CPU 模型验证（不需要 GPU / gpu feature）
 ///
-/// 用纯 Rust 重写 WGSL shader 的算法：探针生成 + 排序数组二分查找 +
-/// 按 (帧, 探针, 位置) 顺序组装。与 HashMap 路径逐字节对比，验证算法
+/// 用纯 Rust 重写 WGSL shader 的算法：16 位直方图 → 桶前缀和 →
+/// 稳定计数排序 → 桶查找组装。与 HashMap 路径逐字节对比，验证算法
 /// 设计的等价性；WGSL 只是同一算法的移植，由 naga 语法校验兜底。
 #[cfg(test)]
 mod hash_filter_model_tests {
@@ -472,33 +472,49 @@ mod hash_filter_model_tests {
         base ^ (1i32 << b1) ^ (1i32 << b2)
     }
 
-    /// 与 WGSL lower/upper bound 对应的二分查找
-    fn match_range(sorted: &[i32], h: i32) -> (usize, usize) {
-        let lo = sorted.partition_point(|&x| x < h);
-        let hi = sorted.partition_point(|&x| x <= h);
-        (lo, hi)
-    }
-
-    /// GPU hash_filter 的 CPU 模型：排序 + 两遍 scan 的单线程等价形式
+    /// GPU hash_filter 的 CPU 模型：
+    /// 直方图 → 桶前缀和 → 稳定计数排序 → 按桶区间组装
     fn model_hash_filter(hash1: &[i32], hash2: &[i32], step: usize) -> gpu::FlatGroups {
-        let mut indexed: Vec<(i32, u32)> = hash2
-            .iter()
-            .enumerate()
-            .map(|(i, &h)| (h, i as u32))
-            .collect();
-        indexed.sort_unstable();
-        let sorted_hash2: Vec<i32> = indexed.iter().map(|&(h, _)| h).collect();
-        let sorted_pos2: Vec<u32> = indexed.iter().map(|&(_, p)| p).collect();
+        const BUCKETS: usize = 65_536;
+        let mut bucket = vec![0u32; BUCKETS + 1];
+        for &h in hash2 {
+            if h == lsh::VAD_SILENCE_MARKER {
+                continue;
+            }
+            bucket[(h as u32 & 0xFFFF) as usize] += 1;
+        }
+        // exclusive 前缀和，末尾保存非 VAD 元素总数
+        let mut acc = 0u32;
+        for slot in bucket.iter_mut().take(BUCKETS) {
+            let c = *slot;
+            *slot = acc;
+            acc += c;
+        }
+        bucket[BUCKETS] = acc;
+
+        // 稳定计数排序：原始顺序写入 → 同桶内位置升序
+        let mut cursor = bucket.clone();
+        let mut sorted_pos = vec![0usize; hash2.len()];
+        for (k, &h) in hash2.iter().enumerate() {
+            if h == lsh::VAD_SILENCE_MARKER {
+                continue;
+            }
+            let b = (h as u32 & 0xFFFF) as usize;
+            sorted_pos[cursor[b] as usize] = k;
+            cursor[b] += 1;
+        }
 
         let mut groups = gpu::FlatGroups::empty();
         for (orig_i, &h) in hash1.iter().enumerate().step_by(step) {
+            if h == lsh::VAD_SILENCE_MARKER {
+                continue;
+            }
             let begin = groups.positions.len();
             for probe_idx in 0..137u32 {
-                let ph = probe_hash(h, probe_idx);
-                let (lo, hi) = match_range(&sorted_hash2, ph);
-                for k in lo..hi {
-                    groups.positions.push(sorted_pos2[k] as usize);
-                }
+                let b = (probe_hash(h, probe_idx) as u32 & 0xFFFF) as usize;
+                let lo = bucket[b] as usize;
+                let hi = bucket[b + 1] as usize;
+                groups.positions.extend_from_slice(&sorted_pos[lo..hi]);
             }
             if groups.positions.len() > begin {
                 groups.frames.push(orig_i);
@@ -570,6 +586,53 @@ mod hash_filter_model_tests {
         let expected = cpu_generate_groups(&hash1, &hash2);
         let model = model_hash_filter(&hash1, &hash2, HASH_WINDOW_SIZE);
         assert_eq!(model, expected);
+    }
+
+    /// VAD 静音标记必须被完全跳过（hash1 与 hash2 两侧都不能产生候选）
+    #[test]
+    fn cpu_model_skips_vad_markers() {
+        let marker = lsh::VAD_SILENCE_MARKER;
+        let mut hash1 = vec![0i32; 200];
+        let mut hash2 = vec![0i32; 300];
+        for k in (0..200).step_by(40) {
+            hash1[k] = marker;
+        }
+        for k in (0..300).step_by(30) {
+            hash2[k] = marker;
+        }
+        for (k, h) in hash1.iter_mut().enumerate() {
+            if *h != marker {
+                *h = (k % 8) as i32;
+            }
+        }
+        for (k, h) in hash2.iter_mut().enumerate() {
+            if *h != marker {
+                *h = (k % 8) as i32;
+            }
+        }
+
+        let expected = cpu_generate_groups(&hash1, &hash2);
+        let model = model_hash_filter(&hash1, &hash2, HASH_WINDOW_SIZE);
+        assert_eq!(model, expected);
+
+        for g in 0..model.len() {
+            let (frame, _) = model.group(g);
+            assert_ne!(hash1[frame], marker, "静音采样帧不应成组");
+        }
+        for (_, p) in model.iter_pairs() {
+            assert_ne!(hash2[p], marker, "静音位置不应成为候选");
+        }
+    }
+
+    /// 完全无匹配：探针最多翻转 2 个 bit，popcount ≥ 3 的值不可能命中
+    #[test]
+    fn cpu_model_no_match_yields_empty() {
+        let hash1 = vec![0i32; 100];
+        let hash2 = vec![0b111i32; 50];
+        let model = model_hash_filter(&hash1, &hash2, HASH_WINDOW_SIZE);
+        assert!(model.is_empty());
+        assert_eq!(model.starts, vec![0]);
+        assert_eq!(model, cpu_generate_groups(&hash1, &hash2));
     }
 
     /// 扁平分组不变量 + 与嵌套 `Vec` 表示逐组等价
