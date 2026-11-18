@@ -1276,7 +1276,7 @@ mod imp {
         source.replace("WG_PLACEHOLDER", &WORKGROUP_SIZE.to_string())
     }
 
-    const SHADER: &str = r#"
+    pub(crate) const SHADER: &str = r#"
 struct Params {
     width: u32,
     size: u32,
@@ -1547,6 +1547,18 @@ mod tests {
     use super::*;
     use crate::core::matching::lsh;
     use ndarray::Array2;
+
+    /// 余弦相似度 shader 语法与类型校验（不需要 GPU 硬件）
+    #[test]
+    fn cosine_shader_passes_naga_validation() {
+        let source = super::imp::substitute_wg(super::imp::SHADER);
+        let module = naga::front::wgsl::parse_str(&source).expect("SHADER WGSL 解析失败");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator.validate(&module).expect("SHADER naga 校验失败");
+    }
 
     /// WGSL 离线语法与类型校验：不需要 GPU 硬件，CI 也能验证 shader 合法
     #[test]
