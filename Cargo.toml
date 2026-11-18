@@ -90,3 +90,9 @@ naga = { version = "0.20", features = ["wgsl-in"] }
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# 本机快速发布构建：thin LTO + 多 codegen 单元，编译更快，运行时略慢
+[profile.quick]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
