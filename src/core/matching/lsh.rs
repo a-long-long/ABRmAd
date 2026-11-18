@@ -19,6 +19,17 @@ const NUM_HASH_BITS: usize = 16;
 /// 多探针 LSH 的探针半径（检查相差 ≤ 此位数的哈希）
 pub const PROBE_RADIUS: usize = 2;
 
+/// VAD 静音窗口标记
+///
+/// 当启用 VAD 语音活动检测时，静音区间内的 hash 窗口会被置为这个值，
+/// 下游 scan.rs / gpu.rs 候选生成处会直接跳过，避免静音帧互相命中
+/// 产生假候选。
+///
+/// LSH hash 是 16 bit 合成值，范围 0..=65535；
+/// i32::MIN = -2147483648 永远不会由 LSH hash 产生，
+/// 所以用作哨兵值安全。
+pub const VAD_SILENCE_MARKER: i32 = i32::MIN;
+
 /// 初始化 LSH 随机向量
 ///
 /// # 参数

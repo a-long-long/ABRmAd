@@ -76,6 +76,10 @@ const TOP_RECHECK: usize = 8;
 fn cpu_generate_groups(hash1: &[i32], hash2: &[i32]) -> Vec<(usize, Vec<usize>)> {
     let mut pos: HashMap<i32, Vec<usize>> = HashMap::new();
     for (i, &h) in hash2.iter().enumerate() {
+        // VAD 静音窗口跳过：不会命中任何真实候选
+        if h == lsh::VAD_SILENCE_MARKER {
+            continue;
+        }
         pos.entry(h).or_default().push(i);
     }
 
@@ -84,6 +88,10 @@ fn cpu_generate_groups(hash1: &[i32], hash2: &[i32]) -> Vec<(usize, Vec<usize>)>
     // 复用的探针缓冲区，避免每个采样帧都重新分配
     let mut probes: Vec<i32> = Vec::new();
     for (i, &h) in hash1.iter().enumerate().step_by(HASH_WINDOW_SIZE) {
+        // VAD 静音窗口跳过：该帧组没有有效 hash，自然不需要候选
+        if h == lsh::VAD_SILENCE_MARKER {
+            continue;
+        }
         let mut positions = Vec::new();
         // 多探针 LSH：检查原始哈希 + 邻近哈希
         lsh::multi_probe_hashes_into(h, &mut probes);

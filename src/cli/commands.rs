@@ -65,6 +65,16 @@ enum Commands {
         /// 仅在提供 --srt-dir 时生效。
         #[arg(long, value_delimiter = ',')]
         keywords: Vec<String>,
+
+        /// 启用 VAD 语音活动检测（跳过静音帧，节省算力）。
+        /// 默认不启用。
+        #[arg(long)]
+        vad: bool,
+
+        /// VAD 阈值（dBFS，范围 [-100, 0]，默认 -30）。
+        /// 仅在启用 --vad 时生效。值越低越宽松（保留更多帧）。
+        #[arg(long, requires = "vad")]
+        vad_threshold: Option<f64>,
     },
 
     /// 裁剪音频文件（根据检测结果）
@@ -144,6 +154,8 @@ pub fn run() -> Result<()> {
             export_debug,
             srt_dir,
             keywords,
+            vad,
+            vad_threshold,
         } => cmd_detect(
             &files,
             output.as_ref(),
@@ -153,6 +165,8 @@ pub fn run() -> Result<()> {
             export_debug.as_ref(),
             srt_dir.as_ref(),
             keywords,
+            vad,
+            vad_threshold,
         ),
         Commands::Cut {
             input_dir,
@@ -194,6 +208,8 @@ fn cmd_detect(
     export_debug: Option<&PathBuf>,
     srt_dir: Option<&PathBuf>,
     keywords: Vec<String>,
+    vad: bool,
+    vad_threshold: Option<f64>,
 ) -> Result<()> {
     println!("开始检测广告...");
     println!("输入文件数量: {}", files.len());
@@ -267,6 +283,21 @@ fn cmd_detect(
             loaded_subtitles: subs_per_file,
             fusion_config: fusion_cfg,
         });
+    }
+    if vad {
+        use crate::core::dsp::vad::VadParams;
+        let params = match vad_threshold {
+            Some(t) => VadParams::new(t),
+            None => VadParams::default(),
+        };
+        params
+            .validate()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        opts = opts.with_vad_params(params);
+        println!(
+            "VAD: 启用 (threshold_dbfs={})",
+            opts.vad_params.as_ref().unwrap().threshold_dbfs
+        );
     }
     // 复用同一个进度条，避免每次回调新建导致大量瞬时条
     let pb = progress_bar(1000);

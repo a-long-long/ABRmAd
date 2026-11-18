@@ -35,6 +35,19 @@ pub fn hash_path(input: &Path) -> PathBuf {
     cache_dir().join(format!("v{}-{}.hash", CACHE_VERSION, file_key(input)))
 }
 
+/// 带上下文的哈希缓存路径
+///
+/// 用于需要额外参数影响 hash 输出的场景（如 HPSS 分离、VAD 语音活动检测）。
+/// 不同 context_hash 生成不同路径，避免错误复用。
+pub fn hash_path_with_context(input: &Path, context_hash: u64) -> PathBuf {
+    cache_dir().join(format!(
+        "v{}-c{:016x}-{}.hash",
+        CACHE_VERSION,
+        context_hash,
+        file_key(input)
+    ))
+}
+
 /// 由完整路径生成稳定的缓存键（FNV-1a）
 fn file_key(input: &Path) -> String {
     let canonical = std::fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());

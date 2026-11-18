@@ -50,6 +50,11 @@ pub struct DetectOptions {
     /// 多模态融合配置（字幕 + 检测结果重打分）。
     /// 默认 None → 不做字幕融合，保持纯音频检测行为不变。
     pub multimodal: Option<MultimodalConfig>,
+    /// 是否启用 VAD 语音活动检测（跳过静音帧，节省算力）
+    /// 默认 false → 正常检测。
+    pub enable_vad: bool,
+    /// VAD 参数；None 时用默认值（threshold=-30dBFS, 帧长=220, 最小静音帧=3）
+    pub vad_params: Option<crate::core::dsp::vad::VadParams>,
 }
 
 /// 多模态融合配置
@@ -82,6 +87,15 @@ impl DetectOptions {
     }
     pub fn with_multimodal(mut self, cfg: MultimodalConfig) -> Self {
         self.multimodal = Some(cfg);
+        self
+    }
+    pub fn with_vad(mut self) -> Self {
+        self.enable_vad = true;
+        self
+    }
+    pub fn with_vad_params(mut self, params: crate::core::dsp::vad::VadParams) -> Self {
+        self.enable_vad = true;
+        self.vad_params = Some(params);
         self
     }
 }
@@ -261,7 +275,13 @@ where
                 let processed = write_f64_wav(&tmp_wav, &perc)
                     .and_then(|_| fft::process_wav(&tmp_wav))
                     .map(|fft| {
-                        let hash = lsh::hash_all(&fft, HASH_WINDOW_SIZE);
+                        let mut hash = lsh::hash_all(&fft, HASH_WINDOW_SIZE);
+                        apply_vad_to_hash(
+                            &fft,
+                            &mut hash,
+                            opts.enable_vad,
+                            opts.vad_params.as_ref(),
+                        );
                         (fft, hash)
                     });
                 let _ = std::fs::remove_file(&wav_path);
@@ -288,11 +308,42 @@ where
                 } else {
                     0
                 };
-                let hash_data = match cache::read_hash(mp3_path) {
-                    Some(h) if h.len() == expected_hash_len => h,
-                    _ => {
-                        let h = lsh::hash_all(&fft_data, HASH_WINDOW_SIZE);
-                        cache::save_hash(mp3_path, &h)?;
+                // VAD 启用与否影响 hash 输出（静音窗口标记为 VAD_SILENCE_MARKER），
+                // 因此 hash 缓存路径需要加 VAD 参数 hash 隔离，避免开/关 VAD 时
+                // 错误复用旧缓存。
+                let vad_ctx = if opts.enable_vad {
+                    opts.vad_params
+                        .as_ref()
+                        .map(|p| p.cache_hash())
+                        .unwrap_or_default()
+                } else {
+                    0 // 不开 VAD → context = 0，所有不开 VAD 的 cache 共享
+                };
+                let hash_path = cache::hash_path_with_context(mp3_path, vad_ctx);
+                let hash_data = match std::fs::read(&hash_path) {
+                    Ok(bytes) => match bincode::deserialize::<Vec<i32>>(&bytes) {
+                        Ok(h) if h.len() == expected_hash_len => h,
+                        _ => {
+                            let mut h = lsh::hash_all(&fft_data, HASH_WINDOW_SIZE);
+                            apply_vad_to_hash(
+                                &fft_data,
+                                &mut h,
+                                opts.enable_vad,
+                                opts.vad_params.as_ref(),
+                            );
+                            let _ = std::fs::write(&hash_path, bincode::serialize(&h)?);
+                            h
+                        }
+                    },
+                    Err(_) => {
+                        let mut h = lsh::hash_all(&fft_data, HASH_WINDOW_SIZE);
+                        apply_vad_to_hash(
+                            &fft_data,
+                            &mut h,
+                            opts.enable_vad,
+                            opts.vad_params.as_ref(),
+                        );
+                        let _ = std::fs::write(&hash_path, bincode::serialize(&h)?);
                         h
                     }
                 };
@@ -477,6 +528,57 @@ where
             None
         },
     })
+}
+
+/// 在 FFT 幅度矩阵上做 VAD 标记，将静音窗口对应的 hash 置为 VAD_SILENCE_MARKER
+///
+/// # 参数
+/// - `fft`: FFT 幅度矩阵（行=帧，列=频率 bin）
+/// - `hash`: 需要被标记的 hash 数组（被修改）
+/// - `enable_vad`: 开关；false 时不做任何改动
+/// - `vad_params`: VAD 参数；None 时用默认值
+///
+/// # 算法
+/// 1. 逐帧算 FFT row_sum（所有频率 bin 幅度之和）
+/// 2. 与 threshold_dbfs 比较（log_energy > threshold → active）
+/// 3. 逐帧生成 active_mask Vec<bool>
+/// 4. 转换到 HASH_WINDOW_SIZE 粒度：窗口内**所有帧**都 active 才保留，
+///    否则 hash[i] = VAD_SILENCE_MARKER
+fn apply_vad_to_hash(
+    fft: &ndarray::Array2<f64>,
+    hash: &mut [i32],
+    enable_vad: bool,
+    vad_params: Option<&crate::core::dsp::vad::VadParams>,
+) {
+    if !enable_vad || hash.is_empty() {
+        return;
+    }
+    let params = vad_params.cloned().unwrap_or_default();
+    let n_frames = fft.nrows();
+    if n_frames == 0 {
+        return;
+    }
+
+    // 逐帧判定：fft row_sum > threshold → active
+    let threshold_linear = 10.0f64.powf(params.threshold_dbfs / 20.0);
+    let mut active_mask = Vec::with_capacity(n_frames);
+    for f in 0..n_frames {
+        let row_sum: f64 = fft.row(f).iter().sum();
+        // row_sum 是幅度和，不是 RMS；threshold_linear 也用幅度阈值，量级一致
+        let mean_amp = row_sum / fft.ncols() as f64;
+        active_mask.push(mean_amp >= threshold_linear);
+    }
+
+    // 窗口粒度：所有帧都 active 才保留 hash
+    let n_windows = hash.len();
+    for i in 0..n_windows {
+        let window_end = (i + HASH_WINDOW_SIZE).min(n_frames);
+        let window_start = i;
+        let all_active = active_mask[window_start..window_end].iter().all(|&a| a);
+        if !all_active {
+            hash[i] = lsh::VAD_SILENCE_MARKER;
+        }
+    }
 }
 
 /// 将 f64 采样（已归一化）写为单声道 int16 WAV（22050Hz）

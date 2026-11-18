@@ -481,6 +481,7 @@ mod imp {
             .iter()
             .enumerate()
             .step_by(step)
+            .filter(|(_, &h)| h != crate::core::matching::lsh::VAD_SILENCE_MARKER)
             .map(|(i, &h)| (i, h))
             .collect();
         if sampled.len() < MIN_SAMPLED_FOR_GPU {
@@ -492,6 +493,7 @@ mod imp {
         let mut indexed: Vec<(i32, u32)> = hash2
             .iter()
             .enumerate()
+            .filter(|(_, &h)| h != crate::core::matching::lsh::VAD_SILENCE_MARKER)
             .map(|(i, &h)| (h, i as u32))
             .collect();
         indexed.sort_unstable();

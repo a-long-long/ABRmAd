@@ -6,3 +6,4 @@ pub mod features;
 pub mod fft;
 pub mod segfeat;
 pub mod separation;
+pub mod vad;
