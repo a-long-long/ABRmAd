@@ -28,6 +28,180 @@ const BOUNDARY_REFINE_MAX_SHIFT: usize = 5;
 /// 多特征融合权重：[FFT, MFCC, Chroma]
 const FEATURE_WEIGHTS: [f64; 3] = [0.50, 0.30, 0.20];
 
+/// GPU 批量位置搜索的最小配对数：低于此值走 CPU，避免调度开销不划算
+const FUSION_MIN_PAIRS: usize = 512;
+
+/// f32 定序的安全间隔
+///
+/// GPU 用 f32 计算相似度，f32 在 [0,1] 区间内的累加误差约 1e-5。
+/// 只有 f32 得分落在最优值此间隔内的位置，才可能是真正的最大值，
+/// 这些位置会用 CPU f64 精算一次再定序。
+const FUSION_RECHECK_EPS: f64 = 1e-4;
+
+/// 单个候选需要 f64 精算的位置数上限
+///
+/// 超过说明该候选的得分极度平坦，精算成本与全扫相当，直接交回 CPU。
+const FUSION_MAX_RECHECK: usize = 16;
+
+/// 单个候选的位置搜索（纯 CPU 精确版）
+///
+/// 与原始内层循环逐字等价：i 按升序扫描，严格 `>` 更新，`best_sim` 初值 0.0，
+/// 因此并列最优时保留**最小** i，且所有得分 ≤ 0 时返回 `p1_init`。
+fn best_p1_cpu(
+    feat1: &AudioFeatures,
+    feat2: &AudioFeatures,
+    p1: usize,
+    p2: usize,
+    len1: usize,
+) -> usize {
+    let search_start = p1.saturating_sub(POSITION_SEARCH_RANGE);
+    let search_end = (p1 + POSITION_SEARCH_RANGE).min(len1.saturating_sub(HASH_WINDOW_SIZE));
+
+    let mut best_sim = 0.0f64;
+    let mut best = p1;
+    for i in search_start..search_end {
+        let sim =
+            features::multi_feature_sim(feat1, feat2, i, p2, HASH_WINDOW_SIZE, &FEATURE_WEIGHTS);
+        if sim > best_sim {
+            best_sim = sim;
+            best = i;
+        }
+    }
+    best
+}
+
+/// 批量版位置搜索：把全部候选的搜索窗口合并成一次 GPU 批处理
+///
+/// 返回与 `candidates` 等长的结果；`None` 表示该候选无法批处理（越界、
+/// 批规模不足、无可用 GPU，或 f32 定序不可靠），由调用方回退 `best_p1_cpu`。
+fn batch_best_positions(
+    feat1: &AudioFeatures,
+    feat2: &AudioFeatures,
+    candidates: &[(usize, usize)],
+    len1: usize,
+    len2: usize,
+) -> Vec<Option<usize>> {
+    let mut out = vec![None; candidates.len()];
+
+    // 1. 为每个候选展开搜索窗口，收集全局 (帧1, 帧2) 配对
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    let mut spans: Vec<Option<(usize, usize)>> = Vec::with_capacity(candidates.len());
+    for &(p1, p2) in candidates {
+        if p1 + HASH_WINDOW_SIZE > len1 || p2 + HASH_WINDOW_SIZE > len2 {
+            spans.push(None);
+            continue;
+        }
+        let search_start = p1.saturating_sub(POSITION_SEARCH_RANGE);
+        let search_end = (p1 + POSITION_SEARCH_RANGE).min(len1.saturating_sub(HASH_WINDOW_SIZE));
+        if search_end <= search_start {
+            spans.push(None);
+            continue;
+        }
+        let begin = pairs.len();
+        for i in search_start..search_end {
+            pairs.push((i, p2));
+        }
+        spans.push(Some((begin, pairs.len())));
+    }
+
+    if pairs.len() < FUSION_MIN_PAIRS {
+        return out;
+    }
+
+    // 2. 三路特征各自批量计算余弦相似度；任一不可用则整体回退
+    let Some(fft_sims) =
+        crate::core::matching::gpu::cosine_pairs(&feat1.fft, &feat2.fft, &pairs, HASH_WINDOW_SIZE)
+    else {
+        return out;
+    };
+    let Some(mfcc_sims) = crate::core::matching::gpu::cosine_pairs(
+        &feat1.mfcc,
+        &feat2.mfcc,
+        &pairs,
+        HASH_WINDOW_SIZE,
+    ) else {
+        return out;
+    };
+    let Some(chroma_sims) = crate::core::matching::gpu::cosine_pairs(
+        &feat1.chroma,
+        &feat2.chroma,
+        &pairs,
+        HASH_WINDOW_SIZE,
+    ) else {
+        return out;
+    };
+
+    // 3. 加权融合，然后逐候选定序
+    let fused: Vec<f64> = (0..pairs.len())
+        .map(|k| {
+            FEATURE_WEIGHTS[0] * fft_sims[k]
+                + FEATURE_WEIGHTS[1] * mfcc_sims[k]
+                + FEATURE_WEIGHTS[2] * chroma_sims[k]
+        })
+        .collect();
+
+    pick_best_from_sims(feat1, feat2, candidates, &pairs, &spans, &fused)
+}
+
+/// 从（可能是 f32 精度的）融合得分中为每个候选选出最优位置
+///
+/// GPU 只用 f32 定序：先找出 f32 最优值，再把落在最优值 `FUSION_RECHECK_EPS`
+/// 邻域内的位置用 CPU f64 精算一次。f32 误差远小于该阈值，因此真正的最优点
+/// 必然在邻域内，结果与纯 CPU 全扫完全一致，而精算通常只有 1-2 个位置。
+fn pick_best_from_sims(
+    feat1: &AudioFeatures,
+    feat2: &AudioFeatures,
+    candidates: &[(usize, usize)],
+    pairs: &[(usize, usize)],
+    spans: &[Option<(usize, usize)>],
+    fused: &[f64],
+) -> Vec<Option<usize>> {
+    let mut out = vec![None; candidates.len()];
+    let mut group: Vec<usize> = Vec::with_capacity(FUSION_MAX_RECHECK);
+
+    for (idx, span) in spans.iter().enumerate() {
+        let Some((begin, end)) = *span else {
+            continue;
+        };
+
+        let top = fused[begin..end]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        if top <= 0.0 {
+            // 没有正得分：CPU 结果就是 p1_init
+            out[idx] = Some(candidates[idx].0);
+            continue;
+        }
+
+        group.clear();
+        for k in begin..end {
+            if fused[k] >= top - FUSION_RECHECK_EPS {
+                group.push(k);
+            }
+        }
+        if group.len() > FUSION_MAX_RECHECK {
+            // 得分过于平坦，精算不划算，交回 CPU 全扫
+            continue;
+        }
+
+        // 组内按位置升序（pairs 在 span 内本就是升序），f64 精算 + 严格 `>`
+        let mut best_sim = 0.0f64;
+        let mut best = candidates[idx].0;
+        for &k in &group {
+            let (i, j) = pairs[k];
+            let sim =
+                features::multi_feature_sim(feat1, feat2, i, j, HASH_WINDOW_SIZE, &FEATURE_WEIGHTS);
+            if sim > best_sim {
+                best_sim = sim;
+                best = i;
+            }
+        }
+        out[idx] = Some(best);
+    }
+    out
+}
+
 /// Viterbi 时序一致性过滤
 pub(super) fn viterbi_filter_candidates(candidates: &[(usize, usize, f64)]) -> Vec<(usize, usize)> {
     if candidates.len() < 2 {
@@ -81,40 +255,26 @@ pub(super) fn fine_tune_multi(
 
     let ft = thresholds.fine_tune_threshold;
 
-    for &(p1_init, p2_init) in candidates {
-        let mut p1 = p1_init;
+    // 位置搜索阶段先做一次 GPU 批量计算；不可靠的候选仍回退 CPU 精确比较
+    let batched_best = batch_best_positions(feat1, feat2, candidates, len1, len2);
+
+    for (cand_idx, &(p1_init, p2_init)) in candidates.iter().enumerate() {
         let p2 = p2_init;
 
-        if in_range(ranges1, p1) && in_range(ranges2, p2) {
+        if in_range(ranges1, p1_init) && in_range(ranges2, p2) {
             continue;
         }
 
         // 候选位置必须能容纳完整的哈希窗口
-        if p1 + HASH_WINDOW_SIZE > len1 || p2 + HASH_WINDOW_SIZE > len2 {
+        if p1_init + HASH_WINDOW_SIZE > len1 || p2 + HASH_WINDOW_SIZE > len2 {
             continue;
         }
 
-        let search_start = p1.saturating_sub(POSITION_SEARCH_RANGE);
-        let search_end = (p1 + POSITION_SEARCH_RANGE).min(len1.saturating_sub(HASH_WINDOW_SIZE));
-
-        let mut best_sim = 0.0f64;
-        let mut best_p1 = p1;
-
-        for i in search_start..search_end {
-            let sim = features::multi_feature_sim(
-                feat1,
-                feat2,
-                i,
-                p2,
-                HASH_WINDOW_SIZE,
-                &FEATURE_WEIGHTS,
-            );
-            if sim > best_sim {
-                best_sim = sim;
-                best_p1 = i;
-            }
-        }
-        p1 = best_p1;
+        // 位置搜索：优先用批量结果，否则 CPU 精确计算
+        let p1 = match batched_best.get(cand_idx).copied().flatten() {
+            Some(v) => v,
+            None => best_p1_cpu(feat1, feat2, p1_init, p2, len1),
+        };
 
         // 向后扩展
         let mut next = 0;
@@ -448,5 +608,186 @@ mod tests {
         let (s, e) = refine_boundaries(&feat1, &feat2, 100, 150, 99, 201);
         assert_eq!(s, 100, "起点应向内收缩到第一个高相似度帧");
         assert_eq!(e, 201, "终点本身相似，不应被误收缩");
+    }
+
+    /// `best_p1_cpu` 必须与重构前的内层循环逐字等价
+    #[test]
+    fn best_p1_cpu_matches_original_inline_search() {
+        let feat1 = make_features(400, None, &[]);
+        let feat2 = make_features(500, Some(7), &[]);
+        let len1 = feat1.fft.nrows();
+
+        for p1 in (0..len1 - HASH_WINDOW_SIZE).step_by(13) {
+            let p2 = p1 + 7;
+
+            // 重构前的原始内层循环
+            let search_start = p1.saturating_sub(POSITION_SEARCH_RANGE);
+            let search_end =
+                (p1 + POSITION_SEARCH_RANGE).min(len1.saturating_sub(HASH_WINDOW_SIZE));
+            let mut best_sim = 0.0f64;
+            let mut expected = p1;
+            for i in search_start..search_end {
+                let sim = features::multi_feature_sim(
+                    &feat1,
+                    &feat2,
+                    i,
+                    p2,
+                    HASH_WINDOW_SIZE,
+                    &FEATURE_WEIGHTS,
+                );
+                if sim > best_sim {
+                    best_sim = sim;
+                    expected = i;
+                }
+            }
+
+            assert_eq!(
+                best_p1_cpu(&feat1, &feat2, p1, p2, len1),
+                expected,
+                "p1={p1} 处 best_p1_cpu 与原始循环不一致"
+            );
+        }
+    }
+
+    /// 无 GPU / 批规模不足时批量路径必须整体返回 None（交由 CPU 处理）
+    #[test]
+    fn batch_best_falls_back_without_gpu_or_small_batch() {
+        let feat1 = make_features(400, None, &[]);
+        let feat2 = make_features(500, Some(7), &[]);
+
+        // 少量候选 → 配对数不足 FUSION_MIN_PAIRS
+        let few = vec![(100, 107), (200, 207)];
+        let out = batch_best_positions(&feat1, &feat2, &few, 400, 500);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|v| v.is_none()), "小批量应全部回退 CPU");
+    }
+
+    /// 定序逻辑（EPS 邻域 + f64 精算）必须与 CPU 全扫一致
+    ///
+    /// 用 CPU 精确相似度冒充"GPU 给出的得分"，不依赖显卡即可覆盖
+    /// `pick_best_from_sims` 的全部路径（含 f32 排名被扰动的情况）。
+    #[test]
+    fn pick_best_from_sims_equals_cpu_full_scan() {
+        let feat1 = make_features(400, None, &[]);
+        let feat2 = make_features(500, Some(7), &[]);
+        let len1 = feat1.fft.nrows();
+
+        // 构造若干候选并展开搜索窗口
+        let candidates: Vec<(usize, usize)> =
+            (20..360).step_by(11).map(|p1| (p1, p1 + 7)).collect();
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        let mut spans: Vec<Option<(usize, usize)>> = Vec::new();
+        for &(p1, p2) in &candidates {
+            let start = p1.saturating_sub(POSITION_SEARCH_RANGE);
+            let end = (p1 + POSITION_SEARCH_RANGE).min(len1.saturating_sub(HASH_WINDOW_SIZE));
+            let begin = pairs.len();
+            for i in start..end {
+                pairs.push((i, p2));
+            }
+            spans.push(Some((begin, pairs.len())));
+        }
+
+        // 用 CPU 精确值作为输入（等价于"零误差的 GPU"）
+        let fused: Vec<f64> = pairs
+            .iter()
+            .map(|&(i, j)| {
+                features::multi_feature_sim(
+                    &feat1,
+                    &feat2,
+                    i,
+                    j,
+                    HASH_WINDOW_SIZE,
+                    &FEATURE_WEIGHTS,
+                )
+            })
+            .collect();
+
+        let got = pick_best_from_sims(&feat1, &feat2, &candidates, &pairs, &spans, &fused);
+        for (idx, &(p1, p2)) in candidates.iter().enumerate() {
+            assert_eq!(
+                got[idx],
+                Some(best_p1_cpu(&feat1, &feat2, p1, p2, len1)),
+                "候选 {idx} (p1={p1}) 定序结果与 CPU 全扫不一致"
+            );
+        }
+    }
+
+    /// f32 误差扰动后，定序结果仍必须与 CPU 全扫一致
+    ///
+    /// 给融入得分加入小于 `FUSION_RECHECK_EPS / 2` 的确定性扰动，模拟
+    /// GPU f32 累加误差。由于真正的最优位置必然落在 EPS 邻域内，结果不应改变。
+    #[test]
+    fn pick_best_survives_f32_like_perturbation() {
+        let feat1 = make_features(400, None, &[]);
+        let feat2 = make_features(500, Some(7), &[]);
+        let len1 = feat1.fft.nrows();
+
+        let candidates: Vec<(usize, usize)> = (20..360).step_by(9).map(|p1| (p1, p1 + 7)).collect();
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        let mut spans: Vec<Option<(usize, usize)>> = Vec::new();
+        for &(p1, p2) in &candidates {
+            let start = p1.saturating_sub(POSITION_SEARCH_RANGE);
+            let end = (p1 + POSITION_SEARCH_RANGE).min(len1.saturating_sub(HASH_WINDOW_SIZE));
+            let begin = pairs.len();
+            for i in start..end {
+                pairs.push((i, p2));
+            }
+            spans.push(Some((begin, pairs.len())));
+        }
+
+        // 确定性伪随机扰动，幅度 < EPS/2
+        let perturbed: Vec<f64> = pairs
+            .iter()
+            .enumerate()
+            .map(|(k, &(i, j))| {
+                let exact = features::multi_feature_sim(
+                    &feat1,
+                    &feat2,
+                    i,
+                    j,
+                    HASH_WINDOW_SIZE,
+                    &FEATURE_WEIGHTS,
+                );
+                let noise = (((k * 2654435761usize) % 1000) as f64 / 1000.0 - 0.5)
+                    * (FUSION_RECHECK_EPS / 2.0);
+                exact + noise
+            })
+            .collect();
+
+        let got = pick_best_from_sims(&feat1, &feat2, &candidates, &pairs, &spans, &perturbed);
+        for (idx, &(p1, p2)) in candidates.iter().enumerate() {
+            assert_eq!(
+                got[idx],
+                Some(best_p1_cpu(&feat1, &feat2, p1, p2, len1)),
+                "候选 {idx} (p1={p1}) 在 f32 扰动下定序结果偏离 CPU 全扫"
+            );
+        }
+    }
+
+    /// 有 GPU 时：批量结果必须与 CPU 精确路径一致
+    #[test]
+    fn batch_best_matches_cpu_when_gpu_available() {
+        if crate::core::matching::gpu::backend_name().is_none() {
+            eprintln!("未检测到可用 GPU，跳过");
+            return;
+        }
+        let feat1 = make_features(1200, None, &[]);
+        let feat2 = make_features(1300, Some(7), &[]);
+
+        // 足够多的候选，保证触发 GPU 批处理
+        let candidates: Vec<(usize, usize)> =
+            (50..1150).step_by(7).map(|p1| (p1, p1 + 7)).collect();
+        assert!(candidates.len() * 2 * POSITION_SEARCH_RANGE >= FUSION_MIN_PAIRS);
+
+        let batched = batch_best_positions(&feat1, &feat2, &candidates, 1200, 1300);
+        for (i, &(p1, p2)) in candidates.iter().enumerate() {
+            let cpu = best_p1_cpu(&feat1, &feat2, p1, p2, 1200);
+            match batched[i] {
+                Some(gpu) => assert_eq!(gpu, cpu, "候选 {i} (p1={p1}) GPU 与 CPU 结果不一致"),
+                // None 表示该候选已被判为"f32 定序不可靠"，由调用方回退 CPU，
+                // 会走 best_p1_cpu，因此结果仍然正确。
+                None => {}
+            }
+        }
     }
 }
