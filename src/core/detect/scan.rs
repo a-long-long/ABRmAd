@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ndarray::Array2;
 
+use crate::core::matching::gpu;
 use crate::core::matching::lsh;
 
 use super::Thresholds;
@@ -73,7 +74,8 @@ const TOP_RECHECK: usize = 8;
 /// CPU 候选生成：HashMap 分桶 + 多探针查找
 ///
 /// 与 GPU `hash_filter` 输出顺序一致：采样帧顺序、探针顺序、组内位置升序。
-fn cpu_generate_groups(hash1: &[i32], hash2: &[i32]) -> Vec<(usize, Vec<usize>)> {
+/// 输出扁平结构，避免每帧一次小 `Vec` 分配。
+fn cpu_generate_groups(hash1: &[i32], hash2: &[i32]) -> gpu::FlatGroups {
     let mut pos: HashMap<i32, Vec<usize>> = HashMap::new();
     for (i, &h) in hash2.iter().enumerate() {
         // VAD 静音窗口跳过：不会命中任何真实候选
@@ -83,8 +85,7 @@ fn cpu_generate_groups(hash1: &[i32], hash2: &[i32]) -> Vec<(usize, Vec<usize>)>
         pos.entry(h).or_default().push(i);
     }
 
-    // 先收集每个采样帧的全部候选取位置，再统一计算相似度（便于 GPU 批量处理）
-    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut flat = gpu::FlatGroups::empty();
     // 复用的探针缓冲区，避免每个采样帧都重新分配
     let mut probes: Vec<i32> = Vec::new();
     for (i, &h) in hash1.iter().enumerate().step_by(HASH_WINDOW_SIZE) {
@@ -92,19 +93,20 @@ fn cpu_generate_groups(hash1: &[i32], hash2: &[i32]) -> Vec<(usize, Vec<usize>)>
         if h == lsh::VAD_SILENCE_MARKER {
             continue;
         }
-        let mut positions = Vec::new();
+        let begin = flat.positions.len();
         // 多探针 LSH：检查原始哈希 + 邻近哈希
         lsh::multi_probe_hashes_into(h, &mut probes);
         for &probe_h in &probes {
             if let Some(found) = pos.get(&probe_h) {
-                positions.extend_from_slice(found);
+                flat.positions.extend_from_slice(found);
             }
         }
-        if !positions.is_empty() {
-            groups.push((i, positions));
+        if flat.positions.len() > begin {
+            flat.frames.push(i);
+            flat.starts.push(flat.positions.len());
         }
     }
-    groups
+    flat
 }
 
 /// 计算每个帧组的最高相似度及对应位置
@@ -115,19 +117,18 @@ fn cpu_generate_groups(hash1: &[i32], hash2: &[i32]) -> Vec<(usize, Vec<usize>)>
 fn best_matches(
     fft1: &Array2<f64>,
     fft2: &Array2<f64>,
-    groups: &[(usize, Vec<usize>)],
+    groups: &gpu::FlatGroups,
     gpu_used: &AtomicBool,
 ) -> Vec<(usize, usize, f64)> {
-    let total: usize = groups.iter().map(|(_, ps)| ps.len()).sum();
+    let total = groups.pairs_len();
     if total == 0 || total > MAX_GPU_PAIRS {
         return cpu_best_matches(fft1, fft2, groups);
     }
 
+    // 直接从扁平结构展开配对，无需重建嵌套 Vec
     let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(total);
-    for &(i, ref positions) in groups {
-        for &p in positions {
-            pairs.push((i, p));
-        }
+    for (f, ps) in (0..groups.len()).map(|g| groups.group(g)) {
+        pairs.extend(ps.iter().map(|&p| (f, p)));
     }
 
     if let Some(scores) =
@@ -149,12 +150,13 @@ fn best_matches(
 fn gpu_best_matches_recheck(
     fft1: &Array2<f64>,
     fft2: &Array2<f64>,
-    groups: &[(usize, Vec<usize>)],
+    groups: &gpu::FlatGroups,
     scores: &[f64],
 ) -> Vec<(usize, usize, f64)> {
     let mut out = Vec::with_capacity(groups.len());
     let mut k = 0usize;
-    for &(i, ref positions) in groups {
+    for g in 0..groups.len() {
+        let (i, positions) = groups.group(g);
         let n = positions.len();
 
         // 按 GPU f32 分数降序取前 TOP_RECHECK 个候选索引
@@ -197,29 +199,28 @@ fn gpu_best_matches_recheck(
 fn cpu_best_matches(
     fft1: &Array2<f64>,
     fft2: &Array2<f64>,
-    groups: &[(usize, Vec<usize>)],
+    groups: &gpu::FlatGroups,
 ) -> Vec<(usize, usize, f64)> {
-    groups
-        .iter()
-        .map(|&(i, ref positions)| {
-            let mut best_sim = 0.0f64;
-            let mut best_pos = 0usize;
-            for &p in positions {
-                let sim = lsh::cosine_sim(fft1, fft2, i, p, HASH_WINDOW_SIZE);
-                if sim > best_sim {
-                    best_sim = sim;
-                    best_pos = p;
-                }
+    let mut out = Vec::with_capacity(groups.len());
+    for g in 0..groups.len() {
+        let (i, positions) = groups.group(g);
+        let mut best_sim = 0.0f64;
+        let mut best_pos = 0usize;
+        for &p in positions {
+            let sim = lsh::cosine_sim(fft1, fft2, i, p, HASH_WINDOW_SIZE);
+            if sim > best_sim {
+                best_sim = sim;
+                best_pos = p;
             }
-            (i, best_pos, best_sim)
-        })
-        .collect()
+        }
+        out.push((i, best_pos, best_sim));
+    }
+    out
 }
 
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
     use super::*;
-    use crate::core::matching::gpu;
     use ndarray::Array2;
     use std::sync::atomic::AtomicBool;
 
@@ -249,19 +250,19 @@ mod tests {
     /// 步长取 2 而不是整个窗口，是为了让候选配对总数超过
     /// `gpu::MIN_PAIRS_FOR_GPU`（低于该值时 GPU 接口会主动回退 CPU），
     /// 否则测试根本走不到 GPU 路径。
-    fn make_groups(a_rows: usize, b_rows: usize) -> Vec<(usize, Vec<usize>)> {
+    fn make_groups(a_rows: usize, b_rows: usize) -> gpu::FlatGroups {
         let window = HASH_WINDOW_SIZE;
-        let mut groups = Vec::new();
+        let mut groups = gpu::FlatGroups::empty();
         for i in (0..=a_rows.saturating_sub(window)).step_by(2) {
             // 每个帧组给 16 个候选，其中包含真实最优位置
             let b_max = b_rows.saturating_sub(window);
-            let mut positions = Vec::new();
             let base = (i as i64 * 13 + 7) % b_max as i64;
             let base = base.max(0) as usize;
             for k in 0..16 {
-                positions.push((base + k * 3) % b_max);
+                groups.positions.push((base + k * 3) % b_max);
             }
-            groups.push((i, positions));
+            groups.frames.push(i);
+            groups.starts.push(groups.positions.len());
         }
         groups
     }
@@ -277,12 +278,7 @@ mod tests {
         let (fft1, fft2) = make_spectra();
         let groups = make_groups(fft1.nrows(), fft2.nrows());
 
-        let mut pairs = Vec::new();
-        for &(i, ref pos) in &groups {
-            for &p in pos {
-                pairs.push((i, p));
-            }
-        }
+        let pairs: Vec<(usize, usize)> = groups.iter_pairs().collect();
 
         // CPU 路径
         let cpu_out = cpu_best_matches(&fft1, &fft2, &groups);
@@ -344,18 +340,14 @@ mod tests {
         let (fft1, fft2) = make_spectra();
         let groups = make_groups(fft1.nrows(), fft2.nrows());
 
-        let mut pairs = Vec::new();
-        for &(i, ref pos) in &groups {
-            for &p in pos {
-                pairs.push((i, p));
-            }
-        }
+        let pairs: Vec<(usize, usize)> = groups.iter_pairs().collect();
 
         let scores =
             gpu::cosine_pairs(&fft1, &fft2, &pairs, HASH_WINDOW_SIZE).expect("GPU 应返回结果");
 
         let mut k = 0usize;
-        for &(i, ref positions) in &groups {
+        for g in 0..groups.len() {
+            let (i, positions) = groups.group(g);
             let n = positions.len();
 
             // CPU 真正最优
@@ -413,11 +405,8 @@ mod tests {
         let gpu_groups =
             gpu::hash_filter(&hash1, &hash2, HASH_WINDOW_SIZE).expect("GPU 应返回结果");
 
-        assert_eq!(gpu_groups.len(), cpu_groups.len(), "组数不一致");
-        for (idx, ((gi, gp), (ci, cp))) in gpu_groups.iter().zip(cpu_groups.iter()).enumerate() {
-            assert_eq!(gi, ci, "组 {idx}: 帧索引不一致");
-            assert_eq!(gp, cp, "组 {idx} (帧 {ci}): 候选位置列表不一致");
-        }
+        // 扁平结构可直接整体比较：帧索引、分组边界、组内位置顺序全部一致
+        assert_eq!(gpu_groups, cpu_groups, "GPU 与 CPU 候选分组不一致");
     }
 
     /// 候选数不超过 TOP_RECHECK 的帧组也必须能正常参与粗筛+精算
@@ -430,15 +419,16 @@ mod tests {
 
         let (fft1, fft2) = make_spectra();
         // 第一组只有 1 个候选；第二组足够大，使总配对数超过 GPU 的最小阈值
-        let groups: Vec<(usize, Vec<usize>)> =
-            vec![(0, vec![0]), (4, (0..600).map(|k| k % 100).collect())];
+        let mut groups = gpu::FlatGroups::empty();
+        groups.frames.push(0);
+        groups.positions.push(0);
+        groups.starts.push(groups.positions.len());
+        groups.frames.push(4);
+        // 非降序的 600 个候选（重复值用于填充配对数）
+        groups.positions.extend((0..600).map(|k| k / 6));
+        groups.starts.push(groups.positions.len());
 
-        let mut pairs = Vec::new();
-        for &(i, ref positions) in &groups {
-            for &p in positions {
-                pairs.push((i, p));
-            }
-        }
+        let pairs: Vec<(usize, usize)> = groups.iter_pairs().collect();
         let scores =
             gpu::cosine_pairs(&fft1, &fft2, &pairs, HASH_WINDOW_SIZE).expect("GPU 应返回结果");
 
@@ -490,7 +480,7 @@ mod hash_filter_model_tests {
     }
 
     /// GPU hash_filter 的 CPU 模型：排序 + 两遍 scan 的单线程等价形式
-    fn model_hash_filter(hash1: &[i32], hash2: &[i32], step: usize) -> Vec<(usize, Vec<usize>)> {
+    fn model_hash_filter(hash1: &[i32], hash2: &[i32], step: usize) -> gpu::FlatGroups {
         let mut indexed: Vec<(i32, u32)> = hash2
             .iter()
             .enumerate()
@@ -500,18 +490,19 @@ mod hash_filter_model_tests {
         let sorted_hash2: Vec<i32> = indexed.iter().map(|&(h, _)| h).collect();
         let sorted_pos2: Vec<u32> = indexed.iter().map(|&(_, p)| p).collect();
 
-        let mut groups = Vec::new();
+        let mut groups = gpu::FlatGroups::empty();
         for (orig_i, &h) in hash1.iter().enumerate().step_by(step) {
-            let mut positions = Vec::new();
+            let begin = groups.positions.len();
             for probe_idx in 0..137u32 {
                 let ph = probe_hash(h, probe_idx);
                 let (lo, hi) = match_range(&sorted_hash2, ph);
                 for k in lo..hi {
-                    positions.push(sorted_pos2[k] as usize);
+                    groups.positions.push(sorted_pos2[k] as usize);
                 }
             }
-            if !positions.is_empty() {
-                groups.push((orig_i, positions));
+            if groups.positions.len() > begin {
+                groups.frames.push(orig_i);
+                groups.starts.push(groups.positions.len());
             }
         }
         groups
@@ -579,5 +570,74 @@ mod hash_filter_model_tests {
         let expected = cpu_generate_groups(&hash1, &hash2);
         let model = model_hash_filter(&hash1, &hash2, HASH_WINDOW_SIZE);
         assert_eq!(model, expected);
+    }
+
+    /// 扁平分组不变量 + 与嵌套 `Vec` 表示逐组等价
+    #[test]
+    fn flat_groups_match_nested_representation() {
+        // 空结构必须满足 starts == [0]，下游 group() 才不会越界
+        let empty = gpu::FlatGroups::empty();
+        assert_eq!(empty.starts, vec![0]);
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.pairs_len(), 0);
+        assert_eq!(empty.iter_pairs().count(), 0);
+
+        let n1 = 1500usize;
+        let n2 = 2200usize;
+        let mut state = 0x9e3779b9u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state
+        };
+        let hash1: Vec<i32> = (0..n1).map(|_| (next() % 512) as i32).collect();
+        let hash2: Vec<i32> = (0..n2).map(|_| (next() % 512) as i32).collect();
+
+        let flat = cpu_generate_groups(&hash1, &hash2);
+        assert!(!flat.is_empty());
+
+        // 结构不变量：边界数量、首尾对齐、单调且不出现空组
+        assert_eq!(flat.starts.len(), flat.frames.len() + 1);
+        assert_eq!(flat.starts[0], 0);
+        assert_eq!(flat.starts[flat.starts.len() - 1], flat.positions.len());
+        assert!(flat.starts.windows(2).all(|w| w[0] < w[1]), "不应写入空组");
+
+        // 嵌套参考实现：与扁平版严格同序（采样帧升序、探针顺序、组内位置升序）
+        let mut pos: HashMap<i32, Vec<usize>> = HashMap::new();
+        for (i, &h) in hash2.iter().enumerate() {
+            if h == lsh::VAD_SILENCE_MARKER {
+                continue;
+            }
+            pos.entry(h).or_default().push(i);
+        }
+        let mut nested: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (i, &h) in hash1.iter().enumerate().step_by(HASH_WINDOW_SIZE) {
+            if h == lsh::VAD_SILENCE_MARKER {
+                continue;
+            }
+            let mut positions = Vec::new();
+            for probe_h in lsh::multi_probe_hashes(h) {
+                if let Some(found) = pos.get(&probe_h) {
+                    positions.extend_from_slice(found);
+                }
+            }
+            if !positions.is_empty() {
+                nested.push((i, positions));
+            }
+        }
+
+        assert_eq!(flat.len(), nested.len());
+        for (g, (frame, positions)) in nested.iter().enumerate() {
+            let (f, ps) = flat.group(g);
+            assert_eq!(f, *frame, "组 {g}: 帧索引不一致");
+            assert_eq!(ps, positions.as_slice(), "组 {g}: 候选位置不一致");
+        }
+
+        // iter_pairs 展开顺序必须与嵌套结构逐对一致
+        let expanded: Vec<(usize, usize)> = flat.iter_pairs().collect();
+        let expected: Vec<(usize, usize)> = nested
+            .iter()
+            .flat_map(|(f, ps)| ps.iter().map(move |&p| (*f, p)))
+            .collect();
+        assert_eq!(expanded, expected);
     }
 }

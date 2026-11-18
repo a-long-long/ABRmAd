@@ -6,9 +6,72 @@
 //!
 //! 可通过环境变量 `MP3CUTAD_NO_GPU=1` 强制关闭。
 
+/// 扁平的候选分组
+///
+/// 替代 `Vec<(usize, Vec<usize>)>`：所有候选位置连续存放，每组用
+/// `starts` 边界划分。避免每个采样帧一次小 `Vec` 分配，也避免下游
+/// `best_matches` 再把嵌套结构展开成配对列表。
+///
+/// 不变量：
+/// - `starts.len() == frames.len() + 1`（空结果时 `starts == [0]`）
+/// - `starts[0] == 0`、`starts[last] == positions.len()`、`starts` 单调不减
+/// - 组内位置升序，组按采样帧原始索引升序
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FlatGroups {
+    /// 每组对应的采样帧原始索引
+    pub frames: Vec<usize>,
+    /// 每组在 `positions` 中的起始偏移，长度 = `frames.len() + 1`
+    pub starts: Vec<usize>,
+    /// 全部候选位置，按组连续排列
+    pub positions: Vec<usize>,
+}
+
+impl FlatGroups {
+    /// 空的扁平分组（`starts` 保持 `[0]` 以满足不变量）
+    pub fn empty() -> Self {
+        Self {
+            frames: Vec::new(),
+            starts: vec![0],
+            positions: Vec::new(),
+        }
+    }
+
+    /// 组数
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// 配对总数
+    pub fn pairs_len(&self) -> usize {
+        self.positions.len()
+    }
+
+    /// 第 `g` 组：`(采样帧原始索引, 位置切片)`
+    pub fn group(&self, g: usize) -> (usize, &[usize]) {
+        let s = self.starts[g];
+        let e = self.starts[g + 1];
+        (self.frames[g], &self.positions[s..e])
+    }
+
+    /// 遍历所有 `(帧, 位置)` 配对，按组顺序展开
+    pub fn iter_pairs(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.frames.iter().enumerate().flat_map(move |(g, &f)| {
+            self.positions[self.starts[g]..self.starts[g + 1]]
+                .iter()
+                .map(move |&p| (f, p))
+        })
+    }
+}
+
 #[cfg(not(feature = "gpu"))]
 mod imp {
     use ndarray::Array2;
+
+    use super::FlatGroups;
 
     /// GPU 后端名称（未启用时返回 None）
     pub fn backend_name() -> Option<String> {
@@ -26,11 +89,7 @@ mod imp {
     }
 
     /// GPU 候选生成（未启用 GPU 时返回 None，由调用方走 CPU）
-    pub fn hash_filter(
-        _hash1: &[i32],
-        _hash2: &[i32],
-        _step: usize,
-    ) -> Option<Vec<(usize, Vec<usize>)>> {
+    pub fn hash_filter(_hash1: &[i32], _hash2: &[i32], _step: usize) -> Option<FlatGroups> {
         None
     }
 }
@@ -469,11 +528,7 @@ mod imp {
     /// pass1 每个 (帧, 探针) 线程二分查找计算匹配数；CPU prefix sum 后
     /// pass2 按偏移 scatter 写入。无 atomic、无溢出重试。
     /// 不可用（无 GPU、规模过小、输出超限）时返回 None，调用方回退 CPU。
-    pub fn hash_filter(
-        hash1: &[i32],
-        hash2: &[i32],
-        step: usize,
-    ) -> Option<Vec<(usize, Vec<usize>)>> {
+    pub fn hash_filter(hash1: &[i32], hash2: &[i32], step: usize) -> Option<super::FlatGroups> {
         if step == 0 || hash2.is_empty() {
             return None;
         }
@@ -604,7 +659,7 @@ mod imp {
             }
         }
         if total == 0 {
-            return Some(Vec::new());
+            return Some(super::FlatGroups::empty());
         }
         queue.write_buffer(&counts_buf, 0, bytemuck::cast_slice(&offsets));
 
@@ -634,20 +689,21 @@ mod imp {
 
         let pairs: Vec<[u32; 2]> = read_buffer(device, queue, &out_buf, total)?;
 
-        // 按 (帧, 探针, 位置) 顺序组装 groups，与 CPU 输出一致
-        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        // 直接组装扁平结构：跳过空组，组内位置已按 scatter 顺序升序
+        let mut flat = super::FlatGroups::empty();
         let mut idx = 0usize;
         for (frame, &(orig_i, _)) in sampled.iter().enumerate() {
-            let mut positions = Vec::new();
+            let begin = flat.positions.len();
             while idx < pairs.len() && pairs[idx][0] == frame as u32 {
-                positions.push(pairs[idx][1] as usize);
+                flat.positions.push(pairs[idx][1] as usize);
                 idx += 1;
             }
-            if !positions.is_empty() {
-                groups.push((orig_i, positions));
+            if flat.positions.len() > begin {
+                flat.frames.push(orig_i);
+                flat.starts.push(flat.positions.len());
             }
         }
-        Some(groups)
+        Some(flat)
     }
 
     /// 每帧的探针数：1（原始）+ 16（单 bit）+ 120（双 bit）
