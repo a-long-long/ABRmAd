@@ -6,23 +6,22 @@ use crate::core::dsp::features::{self, AudioFeatures};
 use crate::core::range::{Link, Range};
 use crate::core::viterbi::{self, Candidate};
 
+use super::Thresholds;
 use super::HASH_WINDOW_SIZE;
 
-/// 精细调整时的相似度阈值
-const FINE_TUNE_THRESHOLD: f64 = 0.65;
 /// 精细调整的步长
 const FINE_TUNE_STEP: usize = 1;
 /// 精细调整使用的窗口大小
 const FINE_TUNE_WINDOW: usize = 4;
 /// 位置偏移搜索范围
 const POSITION_SEARCH_RANGE: usize = 5;
-/// 边界收紧阈值：高于此值才保留
+/// 边界收紧阈值：高于此值才保留（保守初始版保持常量，后期可验证是否动态化）
 const BOUNDARY_TIGHTEN_THRESHOLD: f64 = 0.75;
 /// 块级置信度：每块的帧数（10 帧 = 1 秒）
 const CONFIDENCE_BLOCK: usize = 10;
 /// 边界精修窗口（帧）
 const BOUNDARY_REFINE_WINDOW: usize = 2;
-/// 边界精修阈值：低于此值则继续向内收缩
+/// 边界精修阈值：低于此值则继续向内收缩（保守初始版保持常量）
 const BOUNDARY_REFINE_THRESHOLD: f64 = 0.80;
 /// 边界精修时单侧最多收缩的帧数
 const BOUNDARY_REFINE_MAX_SHIFT: usize = 5;
@@ -69,6 +68,7 @@ pub(super) fn fine_tune_multi(
     candidates: &[(usize, usize)],
     file_idx1: usize,
     file_idx2: usize,
+    thresholds: &Thresholds,
 ) -> Vec<Link> {
     let len1 = feat1.fft.nrows();
     let len2 = feat2.fft.nrows();
@@ -78,6 +78,8 @@ pub(super) fn fine_tune_multi(
     if len1 < HASH_WINDOW_SIZE || len2 < HASH_WINDOW_SIZE {
         return links;
     }
+
+    let ft = thresholds.fine_tune_threshold;
 
     for &(p1_init, p2_init) in candidates {
         let mut p1 = p1_init;
@@ -125,7 +127,7 @@ pub(super) fn fine_tune_multi(
                 FINE_TUNE_WINDOW,
                 &FEATURE_WEIGHTS,
             );
-            if sim < FINE_TUNE_THRESHOLD {
+            if sim < ft {
                 break;
             }
             next += FINE_TUNE_STEP;
@@ -142,7 +144,7 @@ pub(super) fn fine_tune_multi(
                 FINE_TUNE_WINDOW,
                 &FEATURE_WEIGHTS,
             );
-            if sim < FINE_TUNE_THRESHOLD {
+            if sim < ft {
                 prev += FINE_TUNE_WINDOW as i64 - 1;
                 break;
             }
@@ -207,7 +209,7 @@ pub(super) fn fine_tune_multi(
         if q2 >= len2 || q2 + span > len2 {
             continue;
         }
-        let score = block_confidence(feat1, feat2, start, q2, span);
+        let score = block_confidence(feat1, feat2, start, q2, span, thresholds);
 
         let mut add1 = Range::new_simple(start as i32, end as i32);
         add1.score = score;
@@ -312,6 +314,7 @@ fn block_confidence(
     start: usize,
     q2: usize,
     len: usize,
+    thresholds: &Thresholds,
 ) -> f64 {
     if len == 0 {
         return 0.0;
@@ -322,6 +325,7 @@ fn block_confidence(
     let mut matched = 0.0;
     let mut blocks = 0usize;
     let mut offset = 0usize;
+    let ft = thresholds.fine_tune_threshold;
 
     while offset < len {
         let window = FINE_TUNE_WINDOW.min(len - offset).max(1);
@@ -334,7 +338,7 @@ fn block_confidence(
                 window,
                 &FEATURE_WEIGHTS,
             );
-            if sim >= FINE_TUNE_THRESHOLD {
+            if sim >= ft {
                 matched += sim;
             }
         }

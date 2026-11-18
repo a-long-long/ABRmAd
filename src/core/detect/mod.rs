@@ -60,6 +60,74 @@ impl DetectOptions {
     }
 }
 
+/// 检测阶段用的相似度阈值集合
+///
+/// 默认值保持与 scan.rs/refine.rs 原硬编码常量完全一致，
+/// 这样不传 thresholds 时所有行为不变。动态阈值机制由调用方
+/// （detect_ad_with_progress）根据音频素材预扫描的统计特征决定是否启用。
+#[derive(Debug, Clone)]
+pub struct Thresholds {
+    /// scan.rs 候选粗筛下限
+    pub min_threshold: f64,
+    /// scan.rs 自适应阈值的上限
+    pub max_threshold: f64,
+    /// refine.rs 精细调整 + block_confidence 下限
+    pub fine_tune_threshold: f64,
+}
+
+impl Default for Thresholds {
+    fn default() -> Self {
+        Self {
+            min_threshold: 0.45,
+            max_threshold: 0.80,
+            fine_tune_threshold: 0.65,
+        }
+    }
+}
+
+/// 频谱平坦度（Tonality 指标）
+///
+/// 返回值 ∈ (0, 1]：接近 0 = 强调性（音乐/人声），接近 1 = 噪声/环境声。
+/// 计算几何平均 / 算术平均，输入全为非负。
+pub(super) fn spectral_flatness(fft: &Array2<f64>) -> f64 {
+    let mut geo_sum = 0.0f64;
+    let mut ari_sum = 0.0f64;
+    let mut count = 0usize;
+    for &val in fft.iter() {
+        let v = val.abs() + 1e-20;
+        geo_sum += v.ln();
+        ari_sum += v;
+        count += 1;
+    }
+    if count == 0 || ari_sum <= 0.0 {
+        return 1.0;
+    }
+    let geo_mean = (geo_sum / count as f64).exp();
+    let ari_mean = ari_sum / count as f64;
+    geo_mean / ari_mean
+}
+
+/// 根据频谱平坦度决定检测阈值
+///
+/// 保守初始版只调整 scan.rs 的 MIN_THRESHOLD 和 refine.rs 的
+/// FINE_TUNE_THRESHOLD，其他阈值保持默认。理由：这两个常量对
+/// "素材信噪比低导致大量相似但不相关候选" 最敏感，提高它们能
+/// 直接减少噪声场景的误报。
+pub(super) fn thresholds_for(flatness: f64) -> Thresholds {
+    let base = Thresholds::default();
+    if flatness > 0.6 {
+        // 噪声/环境声主导 → 提高置信度下限，过滤低质量候选
+        Thresholds {
+            min_threshold: 0.50,
+            max_threshold: 0.82,
+            fine_tune_threshold: 0.68,
+        }
+    } else {
+        // 强调性或中性 → 保持默认
+        base
+    }
+}
+
 /// 哈希窗口大小（帧数）
 pub(super) const HASH_WINDOW_SIZE: usize = 20;
 
@@ -109,6 +177,7 @@ where
     let mut ffts: Vec<Array2<f64>> = Vec::with_capacity(num_files);
     let mut feats: Vec<AudioFeatures> = Vec::with_capacity(num_files);
     let mut hashes: Vec<Vec<i32>> = Vec::with_capacity(num_files);
+    let mut flatnesses: Vec<f64> = Vec::with_capacity(num_files);
 
     // 进度步数：每个文件的预处理 + 每对文件的比较
     let pairs: Vec<(usize, usize)> = (0..num_files)
@@ -212,10 +281,13 @@ where
         };
 
         let feature_data = features::extract_features(&fft_data);
+        // 预扫描频谱平坦度（在 fft_data move 到 ffts 之前计算）
+        let flat = spectral_flatness(&fft_data);
 
         ffts.push(fft_data);
         feats.push(feature_data);
         hashes.push(hash_data);
+        flatnesses.push(flat);
 
         let step = done.fetch_add(1, Ordering::Relaxed) + 1;
         let file_name = mp3_path
@@ -237,14 +309,24 @@ where
         let ranges_i = Arc::new(Mutex::new(Vec::new()));
         let ranges_j = Arc::new(Mutex::new(Vec::new()));
 
-        // 2.1 自适应阈值 + 多探针 LSH（可选的 GPU 批量相似度）
-        let raw_candidates =
-            check_same_adaptive(&ffts[i], &ffts[j], &hashes[i], &hashes[j], &gpu_used);
+        // 2.1 动态阈值：取两文件频谱平坦度的算术平均，映射到 Thresholds
+        let pair_flatness = (flatnesses[i] + flatnesses[j]) / 2.0;
+        let thresholds = thresholds_for(pair_flatness);
 
-        // 2.2 Viterbi 时序一致性过滤
+        // 2.2 自适应阈值 + 多探针 LSH（可选的 GPU 批量相似度）
+        let raw_candidates = check_same_adaptive(
+            &ffts[i],
+            &ffts[j],
+            &hashes[i],
+            &hashes[j],
+            &gpu_used,
+            &thresholds,
+        );
+
+        // 2.3 Viterbi 时序一致性过滤
         let filtered_candidates = viterbi_filter_candidates(&raw_candidates);
 
-        // 2.3 多特征融合精细调整
+        // 2.4 多特征融合精细调整
         let pair_links = fine_tune_multi(
             &feats[i],
             &feats[j],
@@ -253,6 +335,7 @@ where
             &filtered_candidates,
             i,
             j,
+            &thresholds,
         );
 
         {
@@ -327,4 +410,75 @@ fn write_f64_wav(path: &std::path::Path, samples: &[f64]) -> Result<()> {
     }
     w.finalize()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    /// 默认 Thresholds 必须与 scan.rs/refine.rs 原硬编码常量完全一致
+    /// （保守初始版只改 scan.rs 的 MIN/MAX 和 refine.rs 的 FINE_TUNE）
+    #[test]
+    fn thresholds_default_matches_original_constants() {
+        let t = Thresholds::default();
+        assert_eq!(t.min_threshold, 0.45);
+        assert_eq!(t.max_threshold, 0.80);
+        assert_eq!(t.fine_tune_threshold, 0.65);
+    }
+
+    /// thresholds_for 的保守策略只在 flatness > 0.6 时提升阈值
+    #[test]
+    fn thresholds_for_flatness_mapping() {
+        // 强噪声 / 环境声（flatness 高）→ 提高阈值
+        let noisy = thresholds_for(0.75);
+        assert_eq!(noisy.min_threshold, 0.50);
+        assert_eq!(noisy.max_threshold, 0.82);
+        assert_eq!(noisy.fine_tune_threshold, 0.68);
+
+        // 边缘：flatness 刚好 > 0.6 触发提升
+        let edge_up = thresholds_for(0.601);
+        assert_eq!(edge_up.min_threshold, 0.50);
+
+        // 边缘：flatness 刚好 <= 0.6 保持默认
+        let edge_down = thresholds_for(0.599);
+        assert_eq!(edge_down.min_threshold, 0.45);
+
+        // 强调性（flatness 低）→ 保持默认
+        let tonal = thresholds_for(0.25);
+        assert_eq!(tonal.min_threshold, 0.45);
+        assert_eq!(tonal.max_threshold, 0.80);
+        assert_eq!(tonal.fine_tune_threshold, 0.65);
+    }
+
+    /// 全零 FFT → flatness 应该接近 1（纯噪声/无结构）
+    #[test]
+    fn spectral_flatness_zero_input() {
+        let fft = Array2::<f64>::zeros((10, 5));
+        let flat = spectral_flatness(&fft);
+        // 加了 1e-20 保护后，全零输入的几何/算术比非常接近 1
+        assert!(flat > 0.5, "全零 FFT 应表现为高平坦度，实际 {flat}");
+    }
+
+    /// 重复相同值 → flatness = 1（完全没有结构）
+    #[test]
+    fn spectral_flatness_constant_input() {
+        let fft = Array2::from_shape_fn((100, 50), |_| 42.0);
+        let flat = spectral_flatness(&fft);
+        assert!(
+            (flat - 1.0).abs() < 0.01,
+            "常数值输入 flatness 应 ≈ 1，实际 {flat}"
+        );
+    }
+
+    /// 单一强音 bin（结构极强）→ flatness 应该很低
+    #[test]
+    fn spectral_flatness_single_peak() {
+        let mut fft = Array2::zeros((100, 50));
+        for row in 0..100 {
+            fft[[row, 5]] = 100.0; // 一个 bin 特别强
+        }
+        let flat = spectral_flatness(&fft);
+        assert!(flat < 0.3, "单一强峰应表现为强调性，flatness={flat}");
+    }
 }

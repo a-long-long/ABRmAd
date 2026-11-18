@@ -10,12 +10,9 @@ use ndarray::Array2;
 
 use crate::core::matching::lsh;
 
+use super::Thresholds;
 use super::HASH_WINDOW_SIZE;
 
-/// 自适应阈值的最低底线
-const MIN_THRESHOLD: f64 = 0.45;
-/// 自适应阈值的默认上限
-const MAX_THRESHOLD: f64 = 0.80;
 /// 单对文件交给 GPU 的最大候选数，超出后回退 CPU 以控制显存与内存
 const MAX_GPU_PAIRS: usize = 4_000_000;
 
@@ -26,6 +23,7 @@ pub(super) fn check_same_adaptive(
     hash1: &[i32],
     hash2: &[i32],
     gpu_used: &AtomicBool,
+    thresholds: &Thresholds,
 ) -> Vec<(usize, usize, f64)> {
     // 候选生成：优先 GPU（排序 + 二分查找两遍 scan），不可用时回退 CPU HashMap。
     // 两条路径输出的 groups 顺序完全一致，不影响后续 tie-breaking。
@@ -42,21 +40,22 @@ pub(super) fn check_same_adaptive(
     let all_scores: Vec<f64> = best_per_frame
         .iter()
         .map(|&(_, _, sim)| sim)
-        .filter(|&sim| sim >= MIN_THRESHOLD)
+        .filter(|&sim| sim >= thresholds.min_threshold)
         .collect();
 
     if all_scores.is_empty() {
         return Vec::new();
     }
 
-    best_per_frame.retain(|&(_, _, sim)| sim >= MIN_THRESHOLD);
+    best_per_frame.retain(|&(_, _, sim)| sim >= thresholds.min_threshold);
 
-    // 自适应阈值：mean + 1.0 * std，限制在 [MIN_THRESHOLD, MAX_THRESHOLD]
+    // 自适应阈值：mean + 1.0 * std，限制在 [min_threshold, max_threshold]
     let n = all_scores.len() as f64;
     let mean = all_scores.iter().sum::<f64>() / n;
     let variance = all_scores.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / n;
     let std_dev = variance.sqrt();
-    let adaptive_threshold = (mean + 1.0 * std_dev).clamp(MIN_THRESHOLD, MAX_THRESHOLD);
+    let adaptive_threshold =
+        (mean + 1.0 * std_dev).clamp(thresholds.min_threshold, thresholds.max_threshold);
 
     best_per_frame
         .into_iter()
