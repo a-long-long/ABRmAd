@@ -79,6 +79,10 @@ windows-sys = { version = "0.52", features = [
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 
+[dev-dependencies]
+# WGSL 离线语法与类型校验：无 GPU 环境也能验证 shader 合法性
+naga = { version = "0.20", features = ["wgsl-in"] }
+
 [profile.release]
 opt-level = 3
 lto = true

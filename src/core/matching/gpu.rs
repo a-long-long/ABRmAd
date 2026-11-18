@@ -24,6 +24,15 @@ mod imp {
     ) -> Option<Vec<f64>> {
         None
     }
+
+    /// GPU 候选生成（未启用 GPU 时返回 None，由调用方走 CPU）
+    pub fn hash_filter(
+        _hash1: &[i32],
+        _hash2: &[i32],
+        _step: usize,
+    ) -> Option<Vec<(usize, Vec<usize>)>> {
+        None
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -46,11 +55,23 @@ mod imp {
         _pad: u32,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct HashParams {
+        n2: u32,
+        total_probes: u32,
+        _pad0: u32,
+        _pad1: u32,
+    }
+
     struct Backend {
         device: wgpu::Device,
         queue: wgpu::Queue,
         pipeline: wgpu::ComputePipeline,
         bind_group_layout: wgpu::BindGroupLayout,
+        hash_count_pipeline: wgpu::ComputePipeline,
+        hash_scatter_pipeline: wgpu::ComputePipeline,
+        hash_bind_group_layout: wgpu::BindGroupLayout,
         name: String,
     }
 
@@ -139,11 +160,62 @@ mod imp {
             compilation_options: Default::default(),
         });
 
+        // hash filter：count + scatter 两个 entry point 共用同一 shader 与布局
+        let hash_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("hash_filter"),
+            source: wgpu::ShaderSource::Wgsl(HASH_SHADER.into()),
+        });
+        let hash_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("hash_filter_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    storage_entry(1, false),
+                    storage_entry(2, false),
+                    storage_entry(3, false),
+                    storage_entry(4, true),
+                    storage_entry(5, true),
+                ],
+            });
+        let hash_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("hash_filter_layout"),
+            bind_group_layouts: &[&hash_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let hash_count_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("hash_count_pipeline"),
+                layout: Some(&hash_layout),
+                module: &hash_shader,
+                entry_point: "count_main",
+                compilation_options: Default::default(),
+            });
+        let hash_scatter_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("hash_scatter_pipeline"),
+                layout: Some(&hash_layout),
+                module: &hash_shader,
+                entry_point: "scatter_main",
+                compilation_options: Default::default(),
+            });
+
         Some(Backend {
             device,
             queue,
             pipeline,
             bind_group_layout,
+            hash_count_pipeline,
+            hash_scatter_pipeline,
+            hash_bind_group_layout,
             name: info.name,
         })
     }
@@ -347,6 +419,238 @@ mod imp {
         buf
     }
 
+    /// 采样帧数低于此值时直接走 CPU，GPU 调度开销不划算
+    const MIN_SAMPLED_FOR_GPU: usize = 32;
+    /// GPU 候选生成输出上限，与 scan.rs 的 MAX_GPU_PAIRS 对齐
+    const MAX_HASH_FILTER_OUT: usize = 4_000_000;
+
+    /// 从 GPU buffer 读回全部数据
+    fn read_buffer<T: bytemuck::Pod>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src: &wgpu::Buffer,
+        len: usize,
+    ) -> Option<Vec<T>> {
+        let size = (len * std::mem::size_of::<T>()) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hash_staging"),
+            size: size.max(4),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("hash_readback"),
+        });
+        encoder.copy_buffer_to_buffer(src, 0, &staging, 0, size);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv().ok()?.ok()?;
+
+        let data = slice.get_mapped_range();
+        let out: Vec<T> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        Some(out)
+    }
+
+    /// GPU 候选生成：多探针 LSH 在 hash2 中查找每个采样帧的全部匹配位置
+    ///
+    /// 返回与 CPU `check_same_adaptive` 前半段完全一致的 groups：
+    /// `Vec<(原始帧索引, Vec<hash2 位置>)>`，帧顺序、探针顺序、组内位置
+    /// 顺序均相同，保证后续 tie-breaking 行为不变。
+    ///
+    /// 实现：CPU 预排序 hash2（按 (hash, pos) 字典序），GPU 两遍 scan：
+    /// pass1 每个 (帧, 探针) 线程二分查找计算匹配数；CPU prefix sum 后
+    /// pass2 按偏移 scatter 写入。无 atomic、无溢出重试。
+    /// 不可用（无 GPU、规模过小、输出超限）时返回 None，调用方回退 CPU。
+    pub fn hash_filter(
+        hash1: &[i32],
+        hash2: &[i32],
+        step: usize,
+    ) -> Option<Vec<(usize, Vec<usize>)>> {
+        if step == 0 || hash2.is_empty() {
+            return None;
+        }
+        let sampled: Vec<(usize, i32)> = hash1
+            .iter()
+            .enumerate()
+            .step_by(step)
+            .map(|(i, &h)| (i, h))
+            .collect();
+        if sampled.len() < MIN_SAMPLED_FOR_GPU {
+            return None;
+        }
+
+        // (hash, pos) 字典序排序：同 hash 内 pos 升序，与 CPU HashMap 的
+        // 插入顺序一致，保证组内位置顺序相同
+        let mut indexed: Vec<(i32, u32)> = hash2
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| (h, i as u32))
+            .collect();
+        indexed.sort_unstable();
+        let sorted_hash2: Vec<i32> = indexed.iter().map(|&(h, _)| h).collect();
+        let sorted_pos2: Vec<u32> = indexed.iter().map(|&(_, p)| p).collect();
+
+        let backend = backend()?;
+        let device = &backend.device;
+        let queue = &backend.queue;
+
+        let n1 = sampled.len();
+        let total_probes = n1.checked_mul(PROBES_PER_FRAME)?;
+        let params = HashParams {
+            n2: hash2.len() as u32,
+            total_probes: total_probes as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+
+        let hash1_data: Vec<i32> = sampled.iter().map(|&(_, h)| h).collect();
+        let hash1_buf = create_storage(device, "hf_hash1", bytemuck::cast_slice(&hash1_data));
+        let hash2_buf = create_storage(device, "hf_hash2", bytemuck::cast_slice(&sorted_hash2));
+        let pos2_buf = create_storage(device, "hf_pos2", bytemuck::cast_slice(&sorted_pos2));
+        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hf_params"),
+            size: std::mem::size_of::<HashParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params));
+
+        // counts buffer：pass1 写匹配数，CPU prefix sum 后写回作为 scatter 偏移
+        let counts_size = (total_probes * std::mem::size_of::<u32>()) as u64;
+        let counts_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hf_counts"),
+            size: counts_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // pass1 不需要真正的输出 buffer，先绑定 dummy
+        let dummy_out = create_storage(device, "hf_dummy", &[0u8; 8]);
+
+        let make_bind_group = |out: &wgpu::Buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("hf_bg"),
+                layout: &backend.hash_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: hash1_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: hash2_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: pos2_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: counts_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: out.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+
+        let workgroups = (total_probes as u32 + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+
+        // Pass 1：统计每个 (帧, 探针) 的匹配数
+        {
+            let bg = make_bind_group(&dummy_out);
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("hf_count"),
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("hf_count_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&backend.hash_count_pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+            queue.submit(Some(encoder.finish()));
+        }
+
+        let counts: Vec<u32> = read_buffer(device, queue, &counts_buf, total_probes)?;
+
+        // CPU prefix sum（exclusive），同时得到精确总输出大小
+        let mut total = 0usize;
+        let mut offsets: Vec<u32> = Vec::with_capacity(total_probes);
+        for &c in &counts {
+            offsets.push(total as u32);
+            total = total.checked_add(c as usize)?;
+            if total > MAX_HASH_FILTER_OUT {
+                return None;
+            }
+        }
+        if total == 0 {
+            return Some(Vec::new());
+        }
+        queue.write_buffer(&counts_buf, 0, bytemuck::cast_slice(&offsets));
+
+        // Pass 2：按偏移 scatter 写入 (frame, pos)
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hf_out"),
+            size: (total * std::mem::size_of::<[u32; 2]>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        {
+            let bg = make_bind_group(&out_buf);
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("hf_scatter"),
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("hf_scatter_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&backend.hash_scatter_pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+            queue.submit(Some(encoder.finish()));
+        }
+
+        let pairs: Vec<[u32; 2]> = read_buffer(device, queue, &out_buf, total)?;
+
+        // 按 (帧, 探针, 位置) 顺序组装 groups，与 CPU 输出一致
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut idx = 0usize;
+        for (frame, &(orig_i, _)) in sampled.iter().enumerate() {
+            let mut positions = Vec::new();
+            while idx < pairs.len() && pairs[idx][0] == frame as u32 {
+                positions.push(pairs[idx][1] as usize);
+                idx += 1;
+            }
+            if !positions.is_empty() {
+                groups.push((orig_i, positions));
+            }
+        }
+        Some(groups)
+    }
+
+    /// 每帧的探针数：1（原始）+ 16（单 bit）+ 120（双 bit）
+    const PROBES_PER_FRAME: usize = 1 + 16 + 16 * 15 / 2;
+
     const WORKGROUP_SIZE: u32 = 64;
 
     const SHADER: &str = r#"
@@ -389,15 +693,133 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 "#;
+
+    /// hash filter：多探针 LSH 候选生成
+    ///
+    /// 每个线程处理一个 (采样帧, 探针) 对。探针生成顺序与 CPU
+    /// `multi_probe_hashes_into` 完全一致：原始 hash → 单 bit 翻转
+    /// （bit 0..15）→ 双 bit 翻转（b1 0..15, b2 b1+1..16）。
+    /// 二分查找在排序后的 hash2 上定位匹配区间。
+    pub(crate) const HASH_SHADER: &str = r#"
+struct HashParams {
+    n2: u32,
+    total_probes: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
+
+@group(0) @binding(0) var<uniform> params: HashParams;
+@group(0) @binding(1) var<storage, read> hash1: array<i32>;
+@group(0) @binding(2) var<storage, read> sorted_hash2: array<i32>;
+@group(0) @binding(3) var<storage, read> sorted_pos2: array<u32>;
+@group(0) @binding(4) var<storage, read_write> counts: array<u32>;
+@group(0) @binding(5) var<storage, read_write> out_pairs: array<vec2<u32>>;
+
+const NUM_HASH_BITS: u32 = 16u;
+const PROBES_PER_FRAME: u32 = 137u;
+
+fn probe_hash(base: i32, probe_idx: u32) -> i32 {
+    if (probe_idx == 0u) {
+        return base;
+    }
+    if (probe_idx <= NUM_HASH_BITS) {
+        return base ^ (1i << (probe_idx - 1u));
+    }
+    // 双 bit 翻转：与 CPU 的 b1/b2 双重循环顺序一致
+    var k = probe_idx - 1u - NUM_HASH_BITS;
+    var b1 = 0u;
+    var count = NUM_HASH_BITS - 1u;
+    while (k >= count) {
+        k = k - count;
+        b1 = b1 + 1u;
+        count = count - 1u;
+    }
+    let b2 = b1 + 1u + k;
+    return base ^ (1i << b1) ^ (1i << b2);
 }
 
-pub use imp::{backend_name, cosine_pairs};
+fn lower_bound(h: i32) -> u32 {
+    var lo = 0u;
+    var hi = params.n2;
+    while (lo < hi) {
+        let mid = (lo + hi) / 2u;
+        if (sorted_hash2[mid] < h) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+fn upper_bound(h: i32) -> u32 {
+    var lo = 0u;
+    var hi = params.n2;
+    while (lo < hi) {
+        let mid = (lo + hi) / 2u;
+        if (sorted_hash2[mid] <= h) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+@compute @workgroup_size(64)
+fn count_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.total_probes) {
+        return;
+    }
+    let frame = idx / PROBES_PER_FRAME;
+    let probe_idx = idx % PROBES_PER_FRAME;
+    let h = probe_hash(hash1[frame], probe_idx);
+    counts[idx] = upper_bound(h) - lower_bound(h);
+}
+
+@compute @workgroup_size(64)
+fn scatter_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.total_probes) {
+        return;
+    }
+    let frame = idx / PROBES_PER_FRAME;
+    let probe_idx = idx % PROBES_PER_FRAME;
+    let h = probe_hash(hash1[frame], probe_idx);
+    let lo = lower_bound(h);
+    let hi = upper_bound(h);
+    // counts buffer 此时已被 CPU 写回为 exclusive prefix sum 偏移
+    var offset = counts[idx];
+    for (var k = lo; k < hi; k = k + 1u) {
+        out_pairs[offset] = vec2<u32>(frame, sorted_pos2[k]);
+        offset = offset + 1u;
+    }
+}
+"#;
+}
+
+pub use imp::{backend_name, cosine_pairs, hash_filter};
 
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
     use super::*;
     use crate::core::matching::lsh;
     use ndarray::Array2;
+
+    /// WGSL 离线语法与类型校验：不需要 GPU 硬件，CI 也能验证 shader 合法
+    #[test]
+    fn hash_shader_passes_naga_validation() {
+        let module = naga::front::wgsl::parse_str(super::imp::HASH_SHADER)
+            .expect("HASH_SHADER WGSL 解析失败");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .expect("HASH_SHADER naga 校验失败");
+    }
 
     /// GPU 结果需与 CPU 余弦相似度一致；无可用显卡时跳过
     #[test]
