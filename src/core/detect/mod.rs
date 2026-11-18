@@ -193,6 +193,9 @@ where
         .collect();
     let total_steps = (num_files + pairs.len()).max(1);
     let done = AtomicUsize::new(0);
+
+    // Phase 1: 预处理
+    on_progress(0.0, &format!("Phase 1/3: 预处理 {} 个文件", num_files));
     // 预处理失败的文件（不中止整批，仅跳过并记录）
     let mut failed: Vec<String> = Vec::new();
 
@@ -219,7 +222,7 @@ where
 
                 on_progress(
                     idx as f32 / num_files as f32,
-                    &format!("HPSS 分离中 {}/{}: {}", idx + 1, num_files, file_name),
+                    &format!("Phase 1/3 · HPSS {}/{}: {}", idx + 1, num_files, file_name),
                 );
 
                 // 读原始采样 → HPSS 打击乐 → 写临时 WAV
@@ -304,9 +307,20 @@ where
             .unwrap_or_default();
         on_progress(
             step as f32 / total_steps as f32,
-            &format!("预处理音频 {}/{}: {}", idx + 1, num_files, file_name),
+            &format!(
+                "Phase 1/3 · 预处理 {}/{}: {}",
+                step.min(num_files),
+                num_files,
+                file_name
+            ),
         );
     }
+
+    // Phase 2: 两两比对
+    on_progress(
+        num_files as f32 / total_steps as f32,
+        &format!("Phase 2/3: 两两比对 {} 对片段", pairs.len()),
+    );
 
     // 2. 两两比较，查找相似片段
     let links: Arc<Mutex<Vec<Link>>> = Arc::new(Mutex::new(Vec::new()));
@@ -362,11 +376,28 @@ where
         drop(ranges_guard);
 
         let step = done.fetch_add(1, Ordering::Relaxed) + 1;
+        let gpu_tag = if gpu_used.load(Ordering::Relaxed) {
+            "GPU"
+        } else {
+            "CPU"
+        };
         on_progress(
             step as f32 / total_steps as f32,
-            &format!("比对音频片段 {}/{}", step, total_steps),
+            &format!(
+                "Phase 2/3 · 比对 {step}/{total} ({gpu_tag}): {i}↔{j}",
+                total = total_steps - num_files,
+                gpu_tag = gpu_tag,
+                i = i,
+                j = j,
+            ),
         );
     });
+
+    // Phase 3: 区间合并 + 类型计算
+    on_progress(
+        (total_steps - 1) as f32 / total_steps as f32,
+        "Phase 3/3: 区间合并 + 类型计算",
+    );
 
     // 3. 计算区间类型
     let links = Arc::try_unwrap(links).unwrap().into_inner().unwrap();
