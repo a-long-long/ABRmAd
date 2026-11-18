@@ -2,7 +2,11 @@
 
 use std::fmt;
 
+#[cfg(feature = "cli")]
+use serde::Serialize;
+
 /// 表示一个时间区间
+#[cfg_attr(feature = "cli", derive(Serialize))]
 #[derive(Debug, Clone, Copy)]
 pub struct Range {
     pub begin: i32,
@@ -41,6 +45,7 @@ impl fmt::Display for Range {
 }
 
 /// 链接关系，用于关联不同文件中的相似区间
+#[cfg_attr(feature = "cli", derive(Serialize))]
 #[derive(Debug, Clone)]
 pub struct Link {
     pub f1: usize,

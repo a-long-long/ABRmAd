@@ -49,6 +49,12 @@ enum Commands {
         /// 仅在启用 --hpss 时生效。
         #[arg(long, requires = "hpss")]
         hpss_perc_window: Option<usize>,
+
+        /// 将检测过程中的中间数据导出到指定目录
+        /// （ranges.json、每文件 energy.json 和 mel PNG 频谱图）。
+        /// 便于 headless 场景调试和自动化审核。
+        #[arg(long)]
+        export_debug: Option<PathBuf>,
     },
 
     /// 裁剪音频文件（根据检测结果）
@@ -125,12 +131,14 @@ pub fn run() -> Result<()> {
             hpss,
             hpss_harm_window,
             hpss_perc_window,
+            export_debug,
         } => cmd_detect(
             &files,
             output.as_ref(),
             hpss,
             hpss_harm_window,
             hpss_perc_window,
+            export_debug.as_ref(),
         ),
         Commands::Cut {
             input_dir,
@@ -169,6 +177,7 @@ fn cmd_detect(
     hpss: bool,
     hpss_harm_window: Option<usize>,
     hpss_perc_window: Option<usize>,
+    export_debug: Option<&PathBuf>,
 ) -> Result<()> {
     println!("开始检测广告...");
     println!("输入文件数量: {}", files.len());
@@ -206,7 +215,8 @@ fn cmd_detect(
         }
     }
 
-    let opts = if hpss {
+    // 基础选项 + HPSS 参数 + Debug 导出目录
+    let mut opts = if hpss {
         match (hpss_harm_window, hpss_perc_window) {
             (Some(hw), Some(pw)) => {
                 DetectOptions::default().with_hpss_params(HpssParams::new(hw, pw))
@@ -216,6 +226,10 @@ fn cmd_detect(
     } else {
         DetectOptions::default()
     };
+    if let Some(dir) = export_debug {
+        opts = opts.with_export_dir(dir);
+        println!("Debug 导出: {}", dir.display());
+    }
     // 复用同一个进度条，避免每次回调新建导致大量瞬时条
     let pb = progress_bar(1000);
     let result = detect_ad_with_progress(files, opts, |p, msg| {

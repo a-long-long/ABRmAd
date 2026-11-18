@@ -17,7 +17,7 @@ pub mod scan;
 
 pub use merge::reverse_range;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ndarray::Array2;
 use rayon::prelude::*;
 use std::path::PathBuf;
@@ -43,6 +43,10 @@ pub struct DetectOptions {
     pub enable_hpss: bool,
     /// HPSS 分离参数；None 时用默认值（harmonic=17, percussive=11）
     pub hpss_params: Option<HpssParams>,
+    /// 非 None 时，将检测过程中所有中间数据导出到该目录
+    /// （ranges.json、energy.json、mel_spectrogram.png）。
+    /// 仅在启用 cli feature 时可用，无 cli feature 时忽略。
+    pub export_dir: Option<PathBuf>,
 }
 
 impl DetectOptions {
@@ -56,6 +60,10 @@ impl DetectOptions {
     pub fn with_hpss_params(mut self, params: HpssParams) -> Self {
         self.enable_hpss = true;
         self.hpss_params = Some(params);
+        self
+    }
+    pub fn with_export_dir<P: Into<PathBuf>>(mut self, dir: P) -> Self {
+        self.export_dir = Some(dir.into());
         self
     }
 }
@@ -382,6 +390,14 @@ where
         }
     }
 
+    // ---- Debug 导出 ----
+    #[cfg(feature = "cli")]
+    if let Some(dir) = &opts.export_dir {
+        if let Err(e) = export_debug(dir, &mp3_files, &ranges, &lengths, &ffts) {
+            eprintln!("警告：Debug 导出失败（不影响检测结果）：{e}");
+        }
+    }
+
     Ok(DetectionResult {
         ranges,
         lengths,
@@ -410,6 +426,127 @@ fn write_f64_wav(path: &std::path::Path, samples: &[f64]) -> Result<()> {
     }
     w.finalize()?;
     Ok(())
+}
+
+/// Debug 导出：将检测过程中的区间、频谱、能量写入指定目录
+///
+/// 目录结构：
+/// ```text
+/// <dir>/
+/// ├── ranges.json                   # 汇总：所有文件的区间 + 文件路径
+/// ├── energy_<safe_file_idx>.json   # 每文件能量包络（沿时间，dB 刻度）
+/// └── mel_<safe_file_idx>.png       # 每文件 Mel 频谱热力图
+/// ```
+#[cfg(feature = "cli")]
+pub(super) fn export_debug(
+    export_dir: &std::path::Path,
+    files: &[PathBuf],
+    ranges: &[Vec<Range>],
+    lengths: &[usize],
+    ffts: &[Array2<f64>],
+) -> Result<()> {
+    use image::{Rgb, RgbImage};
+    use std::fs;
+
+    fs::create_dir_all(export_dir)
+        .with_context(|| format!("无法创建 debug 导出目录: {}", export_dir.display()))?;
+
+    // ---- ranges.json ----
+    let serializable: Vec<serde_json::Value> = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let r = ranges.get(i).cloned().unwrap_or_default();
+            let len = lengths.get(i).copied().unwrap_or(0);
+            let name = f
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            serde_json::json!({
+                "index": i,
+                "file": name,
+                "length_frames": len,
+                "ranges": r,
+            })
+        })
+        .collect();
+    let wrapper = serde_json::json!({
+        "version": 1,
+        "files": serializable,
+    });
+    let ranges_path = export_dir.join("ranges.json");
+    fs::write(&ranges_path, serde_json::to_string_pretty(&wrapper)?)
+        .with_context(|| format!("无法写入 {}", ranges_path.display()))?;
+
+    // ---- 每文件 energy.json + mel.png ----
+    for (i, fft) in ffts.iter().enumerate() {
+        let frames = fft.nrows();
+        let safe_idx = format!("{:04}", i);
+
+        // energy.json
+        let mut energies = Vec::with_capacity(frames);
+        for f in 0..frames {
+            let sum: f64 = fft.row(f).iter().sum();
+            let db = 20.0 * (sum.max(1e-20)).log10();
+            energies.push(serde_json::json!({
+                "frame": f,
+                "t_sec": f as f64 * 0.0116, // FFT_HOP ≈ 256/22050
+                "energy_db": db,
+            }));
+        }
+        let energy_path = export_dir.join(format!("energy_{}.json", safe_idx));
+        fs::write(&energy_path, serde_json::to_string_pretty(&energies)?)?;
+
+        // mel.png
+        let mel = crate::core::dsp::features::mel_spectrogram(fft);
+        let (mel_frames, mel_bands) = mel.dim();
+        if mel_frames > 0 && mel_bands > 0 {
+            let (width, height) = (mel_frames.min(1920), mel_bands.min(512));
+            let mut flat: Vec<f64> = mel.iter().copied().filter(|v| v.is_finite()).collect();
+            flat.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let (low, high) = if flat.is_empty() {
+                (0.0, 1.0)
+            } else {
+                (flat[flat.len() / 20], flat[flat.len() * 19 / 20])
+            };
+            let span = (high - low).max(1e-9);
+
+            let mut img = RgbImage::new(width as u32, height as u32);
+            for x in 0..width {
+                let mel_frame = (x * mel_frames / width).min(mel_frames.saturating_sub(1));
+                for y in 0..height {
+                    let band =
+                        ((height - 1 - y) * mel_bands / height).min(mel_bands.saturating_sub(1));
+                    let val = mel[[mel_frame, band]];
+                    let level = ((val - low) / span).clamp(0.0, 1.0) as f32;
+                    let [r, g, b] = heat_colormap(level);
+                    img.put_pixel(x as u32, y as u32, Rgb([r, g, b]));
+                }
+            }
+            let mel_path = export_dir.join(format!("mel_{}.png", safe_idx));
+            img.save(&mel_path)
+                .with_context(|| format!("无法写入 {}", mel_path.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// 热力图 colormap：黑红 → 红橙 → 橙黄 → 黄白
+#[cfg(feature = "cli")]
+fn heat_colormap(t: f32) -> [u8; 3] {
+    let t = t.clamp(0.0, 1.0);
+    let (r, g, b) = if t < 0.33 {
+        let k = t / 0.33;
+        (120.0 * k, 20.0 * k, 10.0 * k)
+    } else if t < 0.66 {
+        let k = (t - 0.33) / 0.33;
+        (120.0 + 135.0 * k, 20.0 + 180.0 * k, 10.0 + 20.0 * k)
+    } else {
+        let k = (t - 0.66) / 0.34;
+        (255.0, 200.0 + 55.0 * k, 30.0 + 225.0 * k)
+    };
+    [r as u8, g as u8, b as u8]
 }
 
 #[cfg(test)]
