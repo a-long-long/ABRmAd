@@ -108,37 +108,18 @@ fn batch_best_positions(
         return out;
     }
 
-    // 2. 三路特征各自批量计算余弦相似度；任一不可用则整体回退
-    let Some(fft_sims) =
-        crate::core::matching::gpu::cosine_pairs(&feat1.fft, &feat2.fft, &pairs, HASH_WINDOW_SIZE)
-    else {
-        return out;
-    };
-    let Some(mfcc_sims) = crate::core::matching::gpu::cosine_pairs(
-        &feat1.mfcc,
-        &feat2.mfcc,
+    // 2. 三路特征在同一次 GPU 提交内完成加权融合：
+    //    打包后的 6 个矩阵只上传一次，1 次 dispatch + 1 次回读，
+    //    替代原先三次 cosine_pairs（3 次提交、12 个临时缓冲）
+    let Some(fused) = crate::core::matching::gpu::fused_feature_sim(
+        feat1,
+        feat2,
         &pairs,
         HASH_WINDOW_SIZE,
+        FEATURE_WEIGHTS,
     ) else {
         return out;
     };
-    let Some(chroma_sims) = crate::core::matching::gpu::cosine_pairs(
-        &feat1.chroma,
-        &feat2.chroma,
-        &pairs,
-        HASH_WINDOW_SIZE,
-    ) else {
-        return out;
-    };
-
-    // 3. 加权融合，然后逐候选定序
-    let fused: Vec<f64> = (0..pairs.len())
-        .map(|k| {
-            FEATURE_WEIGHTS[0] * fft_sims[k]
-                + FEATURE_WEIGHTS[1] * mfcc_sims[k]
-                + FEATURE_WEIGHTS[2] * chroma_sims[k]
-        })
-        .collect();
 
     pick_best_from_sims(feat1, feat2, candidates, &pairs, &spans, &fused)
 }

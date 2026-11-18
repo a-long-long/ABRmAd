@@ -92,6 +92,17 @@ mod imp {
     pub fn hash_filter(_hash1: &[i32], _hash2: &[i32], _step: usize) -> Option<FlatGroups> {
         None
     }
+
+    /// 三特征加权融合相似度（未启用 GPU 时返回 None，由调用方走 CPU）
+    pub fn fused_feature_sim(
+        _feat1: &crate::core::dsp::features::AudioFeatures,
+        _feat2: &crate::core::dsp::features::AudioFeatures,
+        _pairs: &[(usize, usize)],
+        _size: usize,
+        _weights: [f64; 3],
+    ) -> Option<Vec<f64>> {
+        None
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -99,6 +110,8 @@ mod imp {
     use std::sync::OnceLock;
 
     use ndarray::Array2;
+
+    use crate::core::dsp::features::AudioFeatures;
 
     /// 单个批次的最大配对数，避免一次提交过大
     const MAX_PAIRS_PER_BATCH: usize = 1 << 18;
@@ -131,6 +144,8 @@ mod imp {
         hash_count_pipeline: wgpu::ComputePipeline,
         hash_scatter_pipeline: wgpu::ComputePipeline,
         hash_bind_group_layout: wgpu::BindGroupLayout,
+        fused_pipeline: wgpu::ComputePipeline,
+        fused_bind_group_layout: wgpu::BindGroupLayout,
         name: String,
     }
 
@@ -267,6 +282,46 @@ mod imp {
                 compilation_options: Default::default(),
             });
 
+        // 三特征融合：一次 dispatch 内完成 3 路余弦相似度并加权求和
+        let fused_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fused_features"),
+            source: wgpu::ShaderSource::Wgsl(FUSED_SHADER.into()),
+        });
+        let fused_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("fused_features_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    storage_entry(1, false),
+                    storage_entry(2, false),
+                    storage_entry(3, false),
+                    storage_entry(4, false),
+                    storage_entry(5, false),
+                    storage_entry(6, true),
+                ],
+            });
+        let fused_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fused_features_layout"),
+            bind_group_layouts: &[&fused_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let fused_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fused_features_pipeline"),
+            layout: Some(&fused_layout),
+            module: &fused_shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
+
         Some(Backend {
             device,
             queue,
@@ -275,6 +330,8 @@ mod imp {
             hash_count_pipeline,
             hash_scatter_pipeline,
             hash_bind_group_layout,
+            fused_pipeline,
+            fused_bind_group_layout,
             name: info.name,
         })
     }
@@ -482,6 +539,231 @@ mod imp {
     const MIN_SAMPLED_FOR_GPU: usize = 32;
     /// GPU 候选生成输出上限，与 scan.rs 的 MAX_GPU_PAIRS 对齐
     const MAX_HASH_FILTER_OUT: usize = 4_000_000;
+
+    /// 融合 kernel 的 uniform 参数
+    ///
+    /// 三个特征（FFT / MFCC / Chroma）的宽度、在打包缓冲中的起始元素偏移、
+    /// 以及加权系数全部一次传入，shader 内统一按 vec4 取分量，避免数组对齐问题。
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct FusedParams {
+        size: u32,
+        count: u32,
+        _pad0: u32,
+        _pad1: u32,
+        widths: [u32; 4],
+        a_offs: [u32; 4],
+        b_offs: [u32; 4],
+        na_offs: [u32; 4],
+        nb_offs: [u32; 4],
+        weights: [f32; 4],
+    }
+
+    /// 单侧（一个文件）三特征打包后的 GPU 输入
+    ///
+    /// 三个矩阵按 FFT → MFCC → Chroma 顺序拼接成一个 f32 缓冲，
+    /// 每帧每个特征的窗口能量和另存为一个 f32 缓冲。这样一次上传即可
+    /// 完成三路相似度，避免之前三次 `cosine_pairs` 各自建缓冲与提交。
+    pub(crate) struct PackedSide {
+        pub data: Vec<f32>,
+        pub norms: Vec<f32>,
+        pub widths: [u32; 3],
+        pub data_offs: [u32; 3],
+        pub norm_offs: [u32; 3],
+    }
+
+    /// 把三特征矩阵打包成一维 f32 缓冲（含每个特征起始行的窗口能量和）
+    pub(crate) fn pack_side(f: &AudioFeatures, size: usize) -> Option<PackedSide> {
+        let matrices = [&f.fft, &f.mfcc, &f.chroma];
+        let rows = f.fft.nrows();
+        let mut data = Vec::new();
+        let mut norms = Vec::new();
+        let mut widths = [0u32; 3];
+        let mut data_offs = [0u32; 3];
+        let mut norm_offs = [0u32; 3];
+
+        for (k, m) in matrices.iter().enumerate() {
+            // 三个特征必须按同一批帧对齐，否则窗口位置无法共享
+            if m.nrows() != rows || m.ncols() == 0 {
+                return None;
+            }
+            widths[k] = m.ncols() as u32;
+            data_offs[k] = data.len() as u32;
+            data.extend(to_f32(m)?);
+            norm_offs[k] = norms.len() as u32;
+            norms.extend(window_norms(m, size));
+        }
+
+        Some(PackedSide {
+            data,
+            norms,
+            widths,
+            data_offs,
+            norm_offs,
+        })
+    }
+
+    /// 三特征加权融合：一次提交完成 FFT/MFCC/Chroma 三路余弦相似度
+    ///
+    /// 输出长度与 `pairs` 相同，每个元素为
+    /// `Σ weight_k × cos_k(window_i, window_j)`。GPU 仍用 f32 加速，
+    /// 调用方（refine）负责用 f64 复算邻域内候选，保证定序与 CPU 一致。
+    pub fn fused_feature_sim(
+        feat1: &AudioFeatures,
+        feat2: &AudioFeatures,
+        pairs: &[(usize, usize)],
+        size: usize,
+        weights: [f64; 3],
+    ) -> Option<Vec<f64>> {
+        if pairs.len() < MIN_PAIRS_FOR_GPU || size == 0 {
+            return None;
+        }
+        let len1 = feat1.fft.nrows();
+        let len2 = feat2.fft.nrows();
+        if size > len1 || size > len2 {
+            return None;
+        }
+        if pairs.iter().any(|&(i, j)| {
+            i.checked_add(size).is_none_or(|e| e > len1)
+                || j.checked_add(size).is_none_or(|e| e > len2)
+        }) {
+            return None;
+        }
+
+        let a = pack_side(feat1, size)?;
+        let b = pack_side(feat2, size)?;
+        // 三路特征的宽度必须一一匹配，否则打包后的窗口布局不同构
+        if a.widths != b.widths {
+            return None;
+        }
+
+        let backend = backend()?;
+        let mut out = Vec::with_capacity(pairs.len());
+        for chunk in pairs.chunks(MAX_PAIRS_PER_BATCH) {
+            let scores = run_fused_batch(backend, &a, &b, chunk, size, weights)?;
+            out.extend(scores);
+        }
+        Some(out)
+    }
+
+    fn run_fused_batch(
+        backend: &Backend,
+        a: &PackedSide,
+        b: &PackedSide,
+        pairs: &[(usize, usize)],
+        size: usize,
+        weights: [f64; 3],
+    ) -> Option<Vec<f64>> {
+        let device = &backend.device;
+        let queue = &backend.queue;
+
+        let pair_data: Vec<[u32; 2]> = pairs.iter().map(|&(i, p)| [i as u32, p as u32]).collect();
+        let params = FusedParams {
+            size: size as u32,
+            count: pairs.len() as u32,
+            _pad0: 0,
+            _pad1: 0,
+            widths: [a.widths[0], a.widths[1], a.widths[2], 0],
+            a_offs: [a.data_offs[0], a.data_offs[1], a.data_offs[2], 0],
+            b_offs: [b.data_offs[0], b.data_offs[1], b.data_offs[2], 0],
+            na_offs: [a.norm_offs[0], a.norm_offs[1], a.norm_offs[2], 0],
+            nb_offs: [b.norm_offs[0], b.norm_offs[1], b.norm_offs[2], 0],
+            weights: [weights[0] as f32, weights[1] as f32, weights[2] as f32, 0.0],
+        };
+
+        let a_buf = create_storage(device, "fused_a", bytemuck::cast_slice(&a.data));
+        let b_buf = create_storage(device, "fused_b", bytemuck::cast_slice(&b.data));
+        let pair_buf = create_storage(device, "fused_pairs", bytemuck::cast_slice(&pair_data));
+        let na_buf = create_storage(device, "fused_norms_a", bytemuck::cast_slice(&a.norms));
+        let nb_buf = create_storage(device, "fused_norms_b", bytemuck::cast_slice(&b.norms));
+        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fused_params"),
+            size: std::mem::size_of::<FusedParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params));
+
+        let out_size = (pairs.len() * std::mem::size_of::<f32>()) as u64;
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fused_scores"),
+            size: out_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fused_scores_staging"),
+            size: out_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fused_features_bg"),
+            layout: &backend.fused_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: a_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: b_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: pair_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: na_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: nb_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: out_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fused_features_encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fused_features_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&backend.fused_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let groups = (pairs.len() as u32).div_ceil(WORKGROUP_SIZE);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, out_size);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv().ok()?.ok()?;
+
+        let data = slice.get_mapped_range();
+        let scores: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+
+        Some(scores.into_iter().map(|v| v as f64).collect())
+    }
 
     /// 从 GPU buffer 读回全部数据
     fn read_buffer<T: bytemuck::Pod>(
@@ -752,6 +1034,87 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+    /// 三特征融合 shader：每个线程处理一个 (帧A, 帧B) 配对
+    ///
+    /// 三路特征的矩阵按 FFT → MFCC → Chroma 拼接在同一个缓冲里，
+    /// 用 `offs` 定位各自起点；窗口能量和（norms）同理。
+    /// 结果 = w0·cos_fft + w1·cos_mfcc + w2·cos_chroma，f32 精度，
+    /// 由调用方做 f64 邻域复算兜底。
+    pub(crate) const FUSED_SHADER: &str = r#"
+struct FusedParams {
+    size: u32,
+    count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    widths: vec4<u32>,
+    a_offs: vec4<u32>,
+    b_offs: vec4<u32>,
+    na_offs: vec4<u32>,
+    nb_offs: vec4<u32>,
+    weights: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> params: FusedParams;
+@group(0) @binding(1) var<storage, read> a: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read> pairs: array<vec2<u32>>;
+@group(0) @binding(4) var<storage, read> norms_a: array<f32>;
+@group(0) @binding(5) var<storage, read> norms_b: array<f32>;
+@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+
+fn feature_sim(width: u32, a_base: u32, b_base: u32, na: f32, nb: f32) -> f32 {
+    let total = params.size * width;
+    var dot = 0.0;
+    for (var k = 0u; k < total; k = k + 1u) {
+        dot = dot + a[a_base + k] * b[b_base + k];
+    }
+    let denom = sqrt(na * nb);
+    if (denom < 1e-8) {
+        return 0.0;
+    }
+    return dot / denom;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.count) {
+        return;
+    }
+    let pair = pairs[idx];
+    let i = pair.x;
+    let j = pair.y;
+
+    let w0 = params.widths.x;
+    let w1 = params.widths.y;
+    let w2 = params.widths.z;
+
+    let s0 = feature_sim(
+        w0,
+        params.a_offs.x + i * w0,
+        params.b_offs.x + j * w0,
+        norms_a[params.na_offs.x + i],
+        norms_b[params.nb_offs.x + j],
+    );
+    let s1 = feature_sim(
+        w1,
+        params.a_offs.y + i * w1,
+        params.b_offs.y + j * w1,
+        norms_a[params.na_offs.y + i],
+        norms_b[params.nb_offs.y + j],
+    );
+    let s2 = feature_sim(
+        w2,
+        params.a_offs.z + i * w2,
+        params.b_offs.z + j * w2,
+        norms_a[params.na_offs.z + i],
+        norms_b[params.nb_offs.z + j],
+    );
+
+    out[idx] = params.weights.x * s0 + params.weights.y * s1 + params.weights.z * s2;
+}
+"#;
+
     /// hash filter：多探针 LSH 候选生成
     ///
     /// 每个线程处理一个 (采样帧, 探针) 对。探针生成顺序与 CPU
@@ -857,7 +1220,7 @@ fn scatter_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 }
 
-pub use imp::{backend_name, cosine_pairs, hash_filter};
+pub use imp::{backend_name, cosine_pairs, fused_feature_sim, hash_filter};
 
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
@@ -922,5 +1285,128 @@ mod tests {
         let a: Array2<f64> = Array2::zeros((8, 8));
         let b: Array2<f64> = Array2::zeros((8, 8));
         assert!(cosine_pairs(&a, &b, &[(0, 0)], 4).is_none());
+    }
+
+    /// 融合 shader 语法与类型校验（不需要 GPU 硬件）
+    #[test]
+    fn fused_shader_passes_naga_validation() {
+        let module = naga::front::wgsl::parse_str(super::imp::FUSED_SHADER)
+            .expect("FUSED_SHADER WGSL 解析失败");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .expect("FUSED_SHADER naga 校验失败");
+    }
+
+    /// 构造三特征矩阵（FFT 64 列、MFCC 13 列、Chroma 12 列，与真实维度一致）
+    fn make_features(rows: usize, seed: f64) -> crate::core::dsp::features::AudioFeatures {
+        let fft = Array2::from_shape_fn((rows, 64), |(i, j)| {
+            ((i * 7 + j * 3) as f64 * seed).sin() * 1.5
+        });
+        let mfcc =
+            Array2::from_shape_fn((rows, 13), |(i, j)| ((i * 5 + j * 2) as f64 * seed).cos());
+        let chroma = Array2::from_shape_fn((rows, 12), |(i, j)| ((i * 3 + j) as f64 * seed).sin());
+        crate::core::dsp::features::AudioFeatures { fft, mfcc, chroma }
+    }
+
+    /// 与融合 shader 逐行对应的 f32 模型（不依赖 GPU）
+    fn model_fused(
+        a: &super::imp::PackedSide,
+        b: &super::imp::PackedSide,
+        i: usize,
+        j: usize,
+        size: usize,
+        weights: [f64; 3],
+    ) -> f64 {
+        let mut score = 0.0f32;
+        for (k, &weight) in weights.iter().enumerate() {
+            let w = a.widths[k] as usize;
+            let a_base = a.data_offs[k] as usize + i * w;
+            let b_base = b.data_offs[k] as usize + j * w;
+            let mut dot = 0.0f32;
+            for x in 0..size * w {
+                dot += a.data[a_base + x] * b.data[b_base + x];
+            }
+            let na = a.norms[a.norm_offs[k] as usize + i];
+            let nb = b.norms[b.norm_offs[k] as usize + j];
+            let denom = (na * nb).sqrt();
+            let sim = if denom < 1e-8 { 0.0 } else { dot / denom };
+            score += weight as f32 * sim;
+        }
+        score as f64
+    }
+
+    /// 打包布局与不变量：拼接顺序、偏移、norms 长度
+    #[test]
+    fn pack_side_layout_is_consistent() {
+        let size = 4;
+        let rows = 40;
+        let f = make_features(rows, 0.017);
+        let p = super::imp::pack_side(&f, size).expect("打包应成功");
+
+        assert_eq!(p.widths, [64, 13, 12]);
+        assert_eq!(
+            p.data_offs,
+            [0, (rows * 64) as u32, (rows * (64 + 13)) as u32]
+        );
+        assert_eq!(p.data.len(), rows * (64 + 13 + 12));
+        let norm_len = rows - size + 1;
+        assert_eq!(p.norms.len(), 3 * norm_len);
+        assert_eq!(p.norm_offs, [0, norm_len as u32, (2 * norm_len) as u32]);
+    }
+
+    /// 打包后的 f32 模型必须与 CPU f64 `multi_feature_sim` 数值一致
+    #[test]
+    fn packed_fused_model_matches_cpu() {
+        let size = 4;
+        let rows = 40;
+        let f1 = make_features(rows, 0.017);
+        let f2 = make_features(rows, 0.023);
+        let a = super::imp::pack_side(&f1, size).unwrap();
+        let b = super::imp::pack_side(&f2, size).unwrap();
+        let weights = [0.50, 0.30, 0.20];
+
+        for &(i, j) in &[(0usize, 0usize), (3, 7), (12, 20), (35, 35)] {
+            let model = model_fused(&a, &b, i, j, size, weights);
+            let cpu = crate::core::dsp::features::multi_feature_sim(&f1, &f2, i, j, size, &weights);
+            assert!(
+                (model - cpu).abs() < 1e-4,
+                "pair ({i},{j}): model={model} cpu={cpu}"
+            );
+        }
+    }
+
+    /// GPU 融合结果必须与 CPU 加权结果一致；无显卡时跳过
+    #[test]
+    fn fused_feature_sim_matches_cpu_when_gpu_available() {
+        if backend_name().is_none() {
+            eprintln!("未检测到可用 GPU，跳过");
+            return;
+        }
+
+        let size = 4;
+        let rows = 60;
+        let f1 = make_features(rows, 0.017);
+        let f2 = make_features(rows, 0.023);
+        let weights = [0.50, 0.30, 0.20];
+
+        let mut pairs = Vec::with_capacity(4096);
+        for k in 0..4096usize {
+            pairs.push((k % (rows - size), (k * 3 + 7) % (rows - size)));
+        }
+
+        let scores = fused_feature_sim(&f1, &f2, &pairs, size, weights).expect("GPU 应返回结果");
+        assert_eq!(scores.len(), pairs.len());
+        for (idx, &(i, j)) in pairs.iter().enumerate().take(256) {
+            let cpu = crate::core::dsp::features::multi_feature_sim(&f1, &f2, i, j, size, &weights);
+            assert!(
+                (scores[idx] - cpu).abs() < 1e-4,
+                "pair {idx} ({i},{j}): gpu={} cpu={cpu}",
+                scores[idx]
+            );
+        }
     }
 }
