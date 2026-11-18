@@ -229,7 +229,7 @@ mod imp {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cosine_pairs"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(substitute_wg(SHADER).into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -271,7 +271,7 @@ mod imp {
         // hash filter：count + scatter 两个 entry point 共用同一 shader 与布局
         let hash_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("hash_filter"),
-            source: wgpu::ShaderSource::Wgsl(HASH_SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(substitute_wg(HASH_SHADER).into()),
         });
         let hash_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -323,7 +323,7 @@ mod imp {
         // 三特征融合：一次 dispatch 内完成 3 路余弦相似度并加权求和
         let fused_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("fused_features"),
-            source: wgpu::ShaderSource::Wgsl(FUSED_SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(substitute_wg(FUSED_SHADER).into()),
         });
         let fused_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1271,6 +1271,11 @@ mod imp {
 
     const WORKGROUP_SIZE: u32 = 64;
 
+    /// 把 shader 模板里的 WG_PLACEHOLDER 替换成当前 WORKGROUP_SIZE
+    pub(crate) fn substitute_wg(source: &str) -> String {
+        source.replace("WG_PLACEHOLDER", &WORKGROUP_SIZE.to_string())
+    }
+
     const SHADER: &str = r#"
 struct Params {
     width: u32,
@@ -1287,7 +1292,7 @@ struct Params {
 @group(0) @binding(5) var<storage, read> norms_b: array<f32>;
 @group(0) @binding(6) var<storage, read_write> out: array<f32>;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(WG_PLACEHOLDER)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= params.count) {
@@ -1353,7 +1358,7 @@ fn feature_sim(width: u32, a_base: u32, b_base: u32, na: f32, nb: f32) -> f32 {
     return dot / denom;
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(WG_PLACEHOLDER)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= params.count) {
@@ -1488,7 +1493,7 @@ fn sort_main() {
     }
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(WG_PLACEHOLDER)
 fn count_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= params.total_probes) {
@@ -1512,7 +1517,7 @@ fn offsets_scan_main() {
     counts[params.total_probes] = acc;
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(WG_PLACEHOLDER)
 fn scatter_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= params.total_probes) {
@@ -1546,8 +1551,8 @@ mod tests {
     /// WGSL 离线语法与类型校验：不需要 GPU 硬件，CI 也能验证 shader 合法
     #[test]
     fn hash_shader_passes_naga_validation() {
-        let module = naga::front::wgsl::parse_str(super::imp::HASH_SHADER)
-            .expect("HASH_SHADER WGSL 解析失败");
+        let source = super::imp::substitute_wg(super::imp::HASH_SHADER);
+        let module = naga::front::wgsl::parse_str(&source).expect("HASH_SHADER WGSL 解析失败");
         let mut validator = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),
@@ -1605,8 +1610,8 @@ mod tests {
     /// 融合 shader 语法与类型校验（不需要 GPU 硬件）
     #[test]
     fn fused_shader_passes_naga_validation() {
-        let module = naga::front::wgsl::parse_str(super::imp::FUSED_SHADER)
-            .expect("FUSED_SHADER WGSL 解析失败");
+        let source = super::imp::substitute_wg(super::imp::FUSED_SHADER);
+        let module = naga::front::wgsl::parse_str(&source).expect("FUSED_SHADER WGSL 解析失败");
         let mut validator = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),

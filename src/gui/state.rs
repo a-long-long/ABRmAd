@@ -2,6 +2,7 @@
 
 use crate::core::classify::EventRange;
 use crate::core::range::Range;
+use crate::core::viterbi::ViterbiConfig;
 use crate::training::TrainSample;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -245,6 +246,8 @@ pub struct AppState {
     pub match_min_score: f64,
     /// 是否对所有文件生效（否则仅当前文件）
     pub match_all_files: bool,
+    /// Viterbi DP 参数自定义：None 表示用内部默认值（max_drift=3, min_chain_score=2.5, ...）
+    pub viterbi_config: Option<ViterbiConfig>,
 }
 
 impl Default for AppState {
@@ -279,6 +282,7 @@ impl Default for AppState {
             match_mode: MatchMode::Low,
             match_min_score: 0.7,
             match_all_files: true,
+            viterbi_config: None,
         }
     }
 }

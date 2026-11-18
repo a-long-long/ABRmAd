@@ -67,19 +67,27 @@ pub(crate) fn start_detection(state: &SharedState) {
 
     thread::spawn(move || {
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let (files, enable_hpss): (Vec<std::path::PathBuf>, bool) = {
+            let (files, enable_hpss, viterbi_cfg): (
+                Vec<std::path::PathBuf>,
+                bool,
+                Option<crate::core::viterbi::ViterbiConfig>,
+            ) = {
                 let s = state.lock().unwrap();
                 (
                     s.files.iter().map(|f| f.path.clone()).collect(),
                     s.enable_hpss,
+                    s.viterbi_config,
                 )
             };
 
-            let opts = if enable_hpss {
+            let mut opts = if enable_hpss {
                 DetectOptions::default().with_hpss()
             } else {
                 DetectOptions::default()
             };
+            if let Some(cfg) = viterbi_cfg {
+                opts = opts.with_viterbi_config(cfg);
+            }
 
             // 进度回调：实时更新进度条与状态文本（可能来自并行线程）
             let progress_state = state.clone();

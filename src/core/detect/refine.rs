@@ -85,7 +85,7 @@ fn batch_best_positions(
     idx1: usize,
     idx2: usize,
 ) -> Vec<Option<usize>> {
-    let mut out = vec![None; candidates.len()];
+    let out = vec![None; candidates.len()];
 
     // 1. 为每个候选展开搜索窗口，收集全局 (帧1, 帧2) 配对
     let mut pairs: Vec<(usize, usize)> = Vec::new();
@@ -189,7 +189,10 @@ fn pick_best_from_sims(
 }
 
 /// Viterbi 时序一致性过滤
-pub(super) fn viterbi_filter_candidates(candidates: &[(usize, usize, f64)]) -> Vec<(usize, usize)> {
+pub(super) fn viterbi_filter_candidates(
+    candidates: &[(usize, usize, f64)],
+    cfg: Option<&viterbi::ViterbiConfig>,
+) -> Vec<(usize, usize)> {
     if candidates.len() < 2 {
         return candidates.iter().map(|&(a, b, _)| (a, b)).collect();
     }
@@ -203,14 +206,15 @@ pub(super) fn viterbi_filter_candidates(candidates: &[(usize, usize, f64)]) -> V
         })
         .collect();
 
-    let config = viterbi::ViterbiConfig {
+    let default = viterbi::ViterbiConfig {
         max_drift: 3,
         max_lookback: 200,
         min_chain_score: 2.5,
         min_chain_length: 2,
     };
+    let config = cfg.unwrap_or(&default);
 
-    let filtered = viterbi::viterbi_filter(&viterbi_candidates, &config);
+    let filtered = viterbi::viterbi_filter(&viterbi_candidates, config);
 
     if filtered.is_empty() {
         candidates.iter().map(|&(a, b, _)| (a, b)).collect()

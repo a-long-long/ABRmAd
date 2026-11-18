@@ -75,6 +75,16 @@ enum Commands {
         /// 仅在启用 --vad 时生效。值越低越宽松（保留更多帧）。
         #[arg(long, requires = "vad")]
         vad_threshold: Option<f64>,
+
+        /// Viterbi 允许的最大相邻匹配偏移漂移（帧，默认 3）。
+        /// 值越大容忍错位，但也更容易引入噪声。
+        #[arg(long)]
+        viterbi_max_drift: Option<usize>,
+
+        /// Viterbi 保留链的最小累计得分（默认 2.5）。
+        /// 值越高过滤越严格。
+        #[arg(long)]
+        viterbi_min_chain_score: Option<f64>,
     },
 
     /// 裁剪音频文件（根据检测结果）
@@ -156,6 +166,8 @@ pub fn run() -> Result<()> {
             keywords,
             vad,
             vad_threshold,
+            viterbi_max_drift,
+            viterbi_min_chain_score,
         } => cmd_detect(
             &files,
             output.as_ref(),
@@ -167,6 +179,8 @@ pub fn run() -> Result<()> {
             keywords,
             vad,
             vad_threshold,
+            viterbi_max_drift,
+            viterbi_min_chain_score,
         ),
         Commands::Cut {
             input_dir,
@@ -210,6 +224,8 @@ fn cmd_detect(
     keywords: Vec<String>,
     vad: bool,
     vad_threshold: Option<f64>,
+    viterbi_max_drift: Option<usize>,
+    viterbi_min_chain_score: Option<f64>,
 ) -> Result<()> {
     println!("开始检测广告...");
     println!("输入文件数量: {}", files.len());
@@ -297,6 +313,21 @@ fn cmd_detect(
         println!(
             "VAD: 启用 (threshold_dbfs={})",
             opts.vad_params.as_ref().unwrap().threshold_dbfs
+        );
+    }
+    if viterbi_max_drift.is_some() || viterbi_min_chain_score.is_some() {
+        use crate::core::viterbi::ViterbiConfig;
+        let mut cfg = ViterbiConfig::default();
+        if let Some(d) = viterbi_max_drift {
+            cfg.max_drift = d;
+        }
+        if let Some(s) = viterbi_min_chain_score {
+            cfg.min_chain_score = s;
+        }
+        opts = opts.with_viterbi_config(cfg);
+        println!(
+            "Viterbi: 自定义 (max_drift={}, min_chain_score={})",
+            cfg.max_drift, cfg.min_chain_score
         );
     }
     // 复用同一个进度条，避免每次回调新建导致大量瞬时条

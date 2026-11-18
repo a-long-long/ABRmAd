@@ -30,6 +30,7 @@ use crate::core::dsp::fft::{self, FFT_LEN};
 use crate::core::dsp::separation::{self, HpssParams};
 use crate::core::matching::lsh;
 use crate::core::range::{Link, Range};
+use crate::core::viterbi::ViterbiConfig;
 
 use merge::{calc_range_types, combine_to_ranges, compress_range};
 use refine::{fine_tune_multi, viterbi_filter_candidates};
@@ -55,6 +56,8 @@ pub struct DetectOptions {
     pub enable_vad: bool,
     /// VAD 参数；None 时用默认值（threshold=-30dBFS, 帧长=220, 最小静音帧=3）
     pub vad_params: Option<crate::core::dsp::vad::VadParams>,
+    /// Viterbi DP 时序一致性过滤参数；None 时用内部默认值
+    pub viterbi_config: Option<ViterbiConfig>,
 }
 
 /// 多模态融合配置
@@ -96,6 +99,10 @@ impl DetectOptions {
     pub fn with_vad_params(mut self, params: crate::core::dsp::vad::VadParams) -> Self {
         self.enable_vad = true;
         self.vad_params = Some(params);
+        self
+    }
+    pub fn with_viterbi_config(mut self, config: ViterbiConfig) -> Self {
+        self.viterbi_config = Some(config);
         self
     }
 }
@@ -425,7 +432,8 @@ where
         );
 
         // 2.3 Viterbi 时序一致性过滤
-        let filtered_candidates = viterbi_filter_candidates(&raw_candidates);
+        let filtered_candidates =
+            viterbi_filter_candidates(&raw_candidates, opts.viterbi_config.as_ref());
 
         // 2.4 多特征融合精细调整
         let pair_links = fine_tune_multi(

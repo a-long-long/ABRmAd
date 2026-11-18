@@ -2,6 +2,7 @@
 //!
 //! 纯文本格式，便于人工查看：
 //! ```text
+//! # engine: cpu                 ← 可选，v2 新增；"gpu: <后端名>" 或 "cpu"
 //! <文件数>
 //! <文件路径>
 //! <总帧数>
@@ -10,6 +11,7 @@
 //! ```
 //!
 //! `score` 为匹配度，旧版结果文件没有该字段时按 0 处理。
+//! 旧版（无 engine 行）仍可正常读取，`gpu` 字段返回 `None`。
 
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -37,6 +39,11 @@ pub fn save(result: &DetectionResult, files: &[PathBuf], output: &Path) -> Resul
         .with_context(|| format!("无法创建结果文件: {}", output.display()))?;
     let mut writer = BufWriter::new(file);
 
+    // engine 标记：gpu 时写入后端名，否则写 cpu
+    match &result.gpu {
+        Some(name) => writeln!(writer, "# engine: gpu: {name}")?,
+        None => writeln!(writer, "# engine: cpu")?,
+    }
     writeln!(writer, "{}", files.len())?;
 
     for (i, path) in files.iter().enumerate() {
@@ -70,7 +77,17 @@ pub fn load_with_paths(path: &Path) -> Result<(Vec<PathBuf>, DetectionResult)> {
         .with_context(|| format!("无法打开结果文件: {}", path.display()))?;
     let mut lines = BufReader::new(file).lines();
 
-    let num_files: usize = next_line(&mut lines)?
+    // 第一行可能是可选的 engine 标记（# engine: gpu: xxx / # engine: cpu），
+    // 也可能直接是文件数（旧版格式）。先尝试解析 engine。
+    let first = next_line(&mut lines)?;
+    let (num_files_line, gpu_info) = if let Some(rest) = first.strip_prefix("# engine: ") {
+        let gpu = rest.strip_prefix("gpu: ").map(|s| s.to_string());
+        (next_line(&mut lines)?, gpu)
+    } else {
+        (first, None)
+    };
+
+    let num_files: usize = num_files_line
         .parse()
         .context("结果文件头不是有效的文件数量")?;
 
@@ -129,7 +146,7 @@ pub fn load_with_paths(path: &Path) -> Result<(Vec<PathBuf>, DetectionResult)> {
     let result = DetectionResult {
         ranges,
         lengths,
-        gpu: None,
+        gpu: gpu_info,
     };
     Ok((paths, result))
 }
@@ -165,6 +182,67 @@ mod tests {
         assert_eq!(loaded.lengths, result.lengths);
         assert_eq!(loaded.ranges.len(), 2);
         assert_eq!(loaded.ranges[0][0].begin, 10);
+        // CPU 路径 → gpu 字段保持 None（"cpu" 是 engine 类型标记，不是后端名）
+        assert_eq!(loaded.gpu, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_load_roundtrip_keeps_gpu_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "abrmad_result_gpu_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result_path = dir.join("result_gpu.txt");
+
+        let files = vec![PathBuf::from("a/1.mp3")];
+        let result = DetectionResult {
+            ranges: vec![vec![Range::new(5, 15, 3)]],
+            lengths: vec![200],
+            gpu: Some("NVIDIA GeForce RTX 4090".to_string()),
+        };
+        save(&result, &files, &result_path).unwrap();
+
+        // 确认文件头包含 engine 标记
+        let raw = std::fs::read_to_string(&result_path).unwrap();
+        assert!(raw.starts_with("# engine: gpu: NVIDIA GeForce RTX 4090\n"));
+
+        let (_, loaded) = load_with_paths(&result_path).unwrap();
+        assert_eq!(loaded.gpu, Some("NVIDIA GeForce RTX 4090".to_string()));
+        assert_eq!(loaded.ranges[0][0].count, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_legacy_file_without_engine_header() {
+        // 旧版格式：第一行直接是文件数，没有 engine 标记
+        let dir = std::env::temp_dir().join(format!(
+            "abrmad_result_legacy_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result_path = dir.join("result_legacy.txt");
+
+        let legacy = "\
+1
+legacy/song.mp3
+500
+1
+100 200 5 0 0.7500
+";
+        std::fs::write(&result_path, legacy).unwrap();
+
+        let (paths, result) = load_with_paths(&result_path).unwrap();
+        assert_eq!(paths[0].as_os_str().to_str().unwrap(), "legacy/song.mp3");
+        assert_eq!(result.lengths[0], 500);
+        assert_eq!(result.ranges[0][0].begin, 100);
+        assert_eq!(result.ranges[0][0].end, 200);
+        assert_eq!(result.gpu, None); // 旧版无 engine 信息 → None
 
         let _ = std::fs::remove_dir_all(&dir);
     }
