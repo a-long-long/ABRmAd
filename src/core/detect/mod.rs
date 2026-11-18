@@ -385,10 +385,20 @@ where
         );
     }
 
+    // Phase 1.5: 三特征常驻 GPU（预算内），供 Phase 2 所有文件对复用
+    // 无 GPU、文件过大或超出显存预算时返回 None，后续自动回退按对上传/CPU
+    let gpu_feats = crate::core::matching::gpu::feature_context(&feats, HASH_WINDOW_SIZE);
+
     // Phase 2: 两两比对
+    let cache_note = match &gpu_feats {
+        Some(ctx) if ctx.resident_files() > 0 => {
+            format!("，GPU 特征常驻 {} 个文件", ctx.resident_files())
+        }
+        _ => String::new(),
+    };
     on_progress(
         num_files as f32 / total_steps as f32,
-        &format!("Phase 2/3: 两两比对 {} 对片段", pairs.len()),
+        &format!("Phase 2/3: 两两比对 {} 对片段{}", pairs.len(), cache_note),
     );
 
     // 2. 两两比较，查找相似片段
@@ -427,6 +437,7 @@ where
             i,
             j,
             &thresholds,
+            gpu_feats.as_ref(),
         );
 
         {

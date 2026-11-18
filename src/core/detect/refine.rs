@@ -3,6 +3,7 @@
 //! Viterbi 过滤剔除孤立候选，多特征相似度用于确定区间起止。
 
 use crate::core::dsp::features::{self, AudioFeatures};
+use crate::core::matching::gpu;
 use crate::core::range::{Link, Range};
 use crate::core::viterbi::{self, Candidate};
 
@@ -80,6 +81,9 @@ fn batch_best_positions(
     candidates: &[(usize, usize)],
     len1: usize,
     len2: usize,
+    gpu_feats: Option<&gpu::FeatureContext>,
+    idx1: usize,
+    idx2: usize,
 ) -> Vec<Option<usize>> {
     let mut out = vec![None; candidates.len()];
 
@@ -109,16 +113,17 @@ fn batch_best_positions(
     }
 
     // 2. 三路特征在同一次 GPU 提交内完成加权融合：
-    //    打包后的 6 个矩阵只上传一次，1 次 dispatch + 1 次回读，
-    //    替代原先三次 cosine_pairs（3 次提交、12 个临时缓冲）
-    let Some(fused) = crate::core::matching::gpu::fused_feature_sim(
-        feat1,
-        feat2,
-        &pairs,
-        HASH_WINDOW_SIZE,
-        FEATURE_WEIGHTS,
-    ) else {
-        return out;
+    //    优先用文件级常驻缓冲（每个文件只上传一次），不可用时回退按对上传
+    let fused = match gpu_feats
+        .and_then(|ctx| ctx.fused_sim(idx1, idx2, &pairs, HASH_WINDOW_SIZE, FEATURE_WEIGHTS))
+    {
+        Some(v) => v,
+        None => {
+            match gpu::fused_feature_sim(feat1, feat2, &pairs, HASH_WINDOW_SIZE, FEATURE_WEIGHTS) {
+                Some(v) => v,
+                None => return out,
+            }
+        }
     };
 
     pick_best_from_sims(feat1, feat2, candidates, &pairs, &spans, &fused)
@@ -215,6 +220,7 @@ pub(super) fn viterbi_filter_candidates(candidates: &[(usize, usize, f64)]) -> V
 }
 
 /// 多特征融合精细调整
+#[allow(clippy::too_many_arguments)]
 pub(super) fn fine_tune_multi(
     feat1: &AudioFeatures,
     feat2: &AudioFeatures,
@@ -224,6 +230,7 @@ pub(super) fn fine_tune_multi(
     file_idx1: usize,
     file_idx2: usize,
     thresholds: &Thresholds,
+    gpu_feats: Option<&gpu::FeatureContext>,
 ) -> Vec<Link> {
     let len1 = feat1.fft.nrows();
     let len2 = feat2.fft.nrows();
@@ -237,7 +244,9 @@ pub(super) fn fine_tune_multi(
     let ft = thresholds.fine_tune_threshold;
 
     // 位置搜索阶段先做一次 GPU 批量计算；不可靠的候选仍回退 CPU 精确比较
-    let batched_best = batch_best_positions(feat1, feat2, candidates, len1, len2);
+    let batched_best = batch_best_positions(
+        feat1, feat2, candidates, len1, len2, gpu_feats, file_idx1, file_idx2,
+    );
 
     for (cand_idx, &(p1_init, p2_init)) in candidates.iter().enumerate() {
         let p2 = p2_init;
@@ -638,7 +647,7 @@ mod tests {
 
         // 少量候选 → 配对数不足 FUSION_MIN_PAIRS
         let few = vec![(100, 107), (200, 207)];
-        let out = batch_best_positions(&feat1, &feat2, &few, 400, 500);
+        let out = batch_best_positions(&feat1, &feat2, &few, 400, 500, None, 0, 1);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|v| v.is_none()), "小批量应全部回退 CPU");
     }
@@ -760,7 +769,7 @@ mod tests {
             (50..1150).step_by(7).map(|p1| (p1, p1 + 7)).collect();
         assert!(candidates.len() * 2 * POSITION_SEARCH_RANGE >= FUSION_MIN_PAIRS);
 
-        let batched = batch_best_positions(&feat1, &feat2, &candidates, 1200, 1300);
+        let batched = batch_best_positions(&feat1, &feat2, &candidates, 1200, 1300, None, 0, 1);
         for (i, &(p1, p2)) in candidates.iter().enumerate() {
             let cpu = best_p1_cpu(&feat1, &feat2, p1, p2, 1200);
             match batched[i] {

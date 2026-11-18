@@ -103,6 +103,36 @@ mod imp {
     ) -> Option<Vec<f64>> {
         None
     }
+
+    /// GPU 特征常驻上下文（未启用 GPU 时为空类型）
+    pub struct FeatureContext;
+
+    impl FeatureContext {
+        /// 未启用 GPU 时恒不可用
+        pub fn fused_sim(
+            &self,
+            _i: usize,
+            _j: usize,
+            _pairs: &[(usize, usize)],
+            _size: usize,
+            _weights: [f64; 3],
+        ) -> Option<Vec<f64>> {
+            None
+        }
+
+        /// 未启用 GPU 时没有常驻文件
+        pub fn resident_files(&self) -> usize {
+            0
+        }
+    }
+
+    /// 未启用 GPU 时没有常驻上下文
+    pub fn feature_context(
+        _feats: &[crate::core::dsp::features::AudioFeatures],
+        _size: usize,
+    ) -> Option<FeatureContext> {
+        None
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -646,10 +676,54 @@ mod imp {
         Some(out)
     }
 
+    /// 已驻留 GPU 的单侧特征缓冲视图（常驻路径与按对上传路径共用）
+    struct SideRef<'a> {
+        data: &'a wgpu::Buffer,
+        norms: &'a wgpu::Buffer,
+        widths: [u32; 3],
+        data_offs: [u32; 3],
+        norm_offs: [u32; 3],
+    }
+
     fn run_fused_batch(
         backend: &Backend,
         a: &PackedSide,
         b: &PackedSide,
+        pairs: &[(usize, usize)],
+        size: usize,
+        weights: [f64; 3],
+    ) -> Option<Vec<f64>> {
+        let device = &backend.device;
+        let a_buf = create_storage(device, "fused_a", bytemuck::cast_slice(&a.data));
+        let b_buf = create_storage(device, "fused_b", bytemuck::cast_slice(&b.data));
+        let na_buf = create_storage(device, "fused_norms_a", bytemuck::cast_slice(&a.norms));
+        let nb_buf = create_storage(device, "fused_norms_b", bytemuck::cast_slice(&b.norms));
+        run_fused_batch_with(
+            backend,
+            SideRef {
+                data: &a_buf,
+                norms: &na_buf,
+                widths: a.widths,
+                data_offs: a.data_offs,
+                norm_offs: a.norm_offs,
+            },
+            SideRef {
+                data: &b_buf,
+                norms: &nb_buf,
+                widths: b.widths,
+                data_offs: b.data_offs,
+                norm_offs: b.norm_offs,
+            },
+            pairs,
+            size,
+            weights,
+        )
+    }
+
+    fn run_fused_batch_with(
+        backend: &Backend,
+        a: SideRef<'_>,
+        b: SideRef<'_>,
         pairs: &[(usize, usize)],
         size: usize,
         weights: [f64; 3],
@@ -671,11 +745,7 @@ mod imp {
             weights: [weights[0] as f32, weights[1] as f32, weights[2] as f32, 0.0],
         };
 
-        let a_buf = create_storage(device, "fused_a", bytemuck::cast_slice(&a.data));
-        let b_buf = create_storage(device, "fused_b", bytemuck::cast_slice(&b.data));
         let pair_buf = create_storage(device, "fused_pairs", bytemuck::cast_slice(&pair_data));
-        let na_buf = create_storage(device, "fused_norms_a", bytemuck::cast_slice(&a.norms));
-        let nb_buf = create_storage(device, "fused_norms_b", bytemuck::cast_slice(&b.norms));
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fused_params"),
             size: std::mem::size_of::<FusedParams>() as u64,
@@ -708,11 +778,11 @@ mod imp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: a_buf.as_entire_binding(),
+                    resource: a.data.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: b_buf.as_entire_binding(),
+                    resource: b.data.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -720,11 +790,11 @@ mod imp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: na_buf.as_entire_binding(),
+                    resource: a.norms.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: nb_buf.as_entire_binding(),
+                    resource: b.norms.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
@@ -763,6 +833,140 @@ mod imp {
         staging.unmap();
 
         Some(scores.into_iter().map(|v| v as f64).collect())
+    }
+
+    /// 常驻特征缓冲的显存预算（超出则整体放弃常驻，回退按对上传）
+    const FUSED_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+    /// 单文件三特征常驻 GPU 的缓冲
+    struct ResidentSide {
+        data: wgpu::Buffer,
+        norms: wgpu::Buffer,
+        widths: [u32; 3],
+        data_offs: [u32; 3],
+        norm_offs: [u32; 3],
+        rows: usize,
+    }
+
+    /// 整个检测任务的 GPU 特征上下文
+    ///
+    /// 每个文件在 Phase 1 结束后上传一次，Phase 2 的任意文件对直接引用，
+    /// 避免同一文件在 N-1 个文件对中重复上传。行数不一致或内存不连续
+    /// 的文件留 `None`，其参与的文件对自动回退按对上传路径。
+    pub struct FeatureContext {
+        sides: Vec<Option<ResidentSide>>,
+    }
+
+    /// 单文件三特征打包后的字节数（数据 + norms）
+    pub(crate) fn side_bytes(f: &AudioFeatures, size: usize) -> Option<usize> {
+        let rows = f.fft.nrows();
+        // 与 pack_side 的准入条件保持一致，避免估算与实际打包不一致
+        if size == 0 || rows < size || f.mfcc.nrows() != rows || f.chroma.nrows() != rows {
+            return None;
+        }
+        let norm_len = rows - size + 1;
+        let elems = f.fft.len() + f.mfcc.len() + f.chroma.len() + 3 * norm_len;
+        elems.checked_mul(std::mem::size_of::<f32>())
+    }
+
+    /// 按预算把全部文件的三特征上传到 GPU；预算不足或不可用时返回 None
+    pub fn feature_context(feats: &[AudioFeatures], size: usize) -> Option<FeatureContext> {
+        let backend = backend()?;
+        let mut total = 0usize;
+        for f in feats {
+            total = total.checked_add(side_bytes(f, size)?)?;
+            if total > FUSED_CACHE_BUDGET_BYTES {
+                return None;
+            }
+        }
+
+        let mut sides = Vec::with_capacity(feats.len());
+        for f in feats {
+            let side = pack_side(f, size).map(|p| {
+                let data = create_storage(
+                    &backend.device,
+                    "ctx_feature_data",
+                    bytemuck::cast_slice(&p.data),
+                );
+                let norms = create_storage(
+                    &backend.device,
+                    "ctx_feature_norms",
+                    bytemuck::cast_slice(&p.norms),
+                );
+                ResidentSide {
+                    data,
+                    norms,
+                    widths: p.widths,
+                    data_offs: p.data_offs,
+                    norm_offs: p.norm_offs,
+                    rows: f.fft.nrows(),
+                }
+            });
+            sides.push(side);
+        }
+        Some(FeatureContext { sides })
+    }
+
+    impl FeatureContext {
+        /// 用常驻缓冲计算文件 `i`、`j` 的融合相似度
+        ///
+        /// 任一文件未常驻、宽度不匹配或配对越界时返回 None，
+        /// 调用方回退 `fused_feature_sim`（按对上传）或纯 CPU。
+        pub fn fused_sim(
+            &self,
+            i: usize,
+            j: usize,
+            pairs: &[(usize, usize)],
+            size: usize,
+            weights: [f64; 3],
+        ) -> Option<Vec<f64>> {
+            if pairs.len() < MIN_PAIRS_FOR_GPU || size == 0 {
+                return None;
+            }
+            let a = self.sides.get(i)?.as_ref()?;
+            let b = self.sides.get(j)?.as_ref()?;
+            if a.widths != b.widths || size > a.rows || size > b.rows {
+                return None;
+            }
+            if pairs.iter().any(|&(x, y)| {
+                x.checked_add(size).is_none_or(|e| e > a.rows)
+                    || y.checked_add(size).is_none_or(|e| e > b.rows)
+            }) {
+                return None;
+            }
+
+            let backend = backend()?;
+            let mut out = Vec::with_capacity(pairs.len());
+            for chunk in pairs.chunks(MAX_PAIRS_PER_BATCH) {
+                let scores = run_fused_batch_with(
+                    backend,
+                    SideRef {
+                        data: &a.data,
+                        norms: &a.norms,
+                        widths: a.widths,
+                        data_offs: a.data_offs,
+                        norm_offs: a.norm_offs,
+                    },
+                    SideRef {
+                        data: &b.data,
+                        norms: &b.norms,
+                        widths: b.widths,
+                        data_offs: b.data_offs,
+                        norm_offs: b.norm_offs,
+                    },
+                    chunk,
+                    size,
+                    weights,
+                )?;
+                out.extend(scores);
+            }
+            Some(out)
+        }
+
+        /// 实际常驻成功的文件数（用于进度提示与诊断）
+        pub fn resident_files(&self) -> usize {
+            self.sides.iter().filter(|s| s.is_some()).count()
+        }
     }
 
     /// 从 GPU buffer 读回全部数据
@@ -1220,7 +1424,9 @@ fn scatter_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 }
 
-pub use imp::{backend_name, cosine_pairs, fused_feature_sim, hash_filter};
+pub use imp::{
+    backend_name, cosine_pairs, feature_context, fused_feature_sim, hash_filter, FeatureContext,
+};
 
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
@@ -1375,6 +1581,57 @@ mod tests {
             assert!(
                 (model - cpu).abs() < 1e-4,
                 "pair ({i},{j}): model={model} cpu={cpu}"
+            );
+        }
+    }
+
+    /// 常驻上下文的显存估算必须与真实打包结果一致
+    #[test]
+    fn side_bytes_matches_packed_size() {
+        let size = 4;
+        let rows = 40;
+        let f = make_features(rows, 0.017);
+        let bytes = super::imp::side_bytes(&f, size).expect("行数足够应可估算");
+        let p = super::imp::pack_side(&f, size).expect("打包应成功");
+        assert_eq!(
+            bytes,
+            (p.data.len() + p.norms.len()) * std::mem::size_of::<f32>()
+        );
+        // 窗口大于帧数时不可估算（也无法常驻）
+        assert!(super::imp::side_bytes(&f, rows + 1).is_none());
+    }
+
+    /// 常驻上下文：无 GPU 时为 None；有 GPU 时应能建立并直接复用缓冲
+    #[test]
+    fn feature_context_follows_backend_availability() {
+        let size = 4;
+        let feats = vec![make_features(60, 0.017), make_features(50, 0.023)];
+        let ctx = feature_context(&feats, size);
+        if backend_name().is_none() {
+            assert!(ctx.is_none(), "无 GPU 时不应建立常驻上下文");
+            return;
+        }
+
+        let ctx = ctx.expect("有 GPU 时应建立常驻上下文");
+        assert_eq!(ctx.resident_files(), 2);
+
+        let mut pairs = Vec::with_capacity(4096);
+        for k in 0..4096usize {
+            pairs.push((k % (60 - size), (k * 3 + 7) % (50 - size)));
+        }
+        let weights = [0.50, 0.30, 0.20];
+        let scores = ctx
+            .fused_sim(0, 1, &pairs, size, weights)
+            .expect("常驻路径应返回结果");
+        assert_eq!(scores.len(), pairs.len());
+        for (idx, &(i, j)) in pairs.iter().enumerate().take(64) {
+            let cpu = crate::core::dsp::features::multi_feature_sim(
+                &feats[0], &feats[1], i, j, size, &weights,
+            );
+            assert!(
+                (scores[idx] - cpu).abs() < 1e-4,
+                "pair {idx} ({i},{j}): ctx={} cpu={cpu}",
+                scores[idx]
             );
         }
     }
