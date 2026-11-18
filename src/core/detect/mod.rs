@@ -47,6 +47,20 @@ pub struct DetectOptions {
     /// （ranges.json、energy.json、mel_spectrogram.png）。
     /// 仅在启用 cli feature 时可用，无 cli feature 时忽略。
     pub export_dir: Option<PathBuf>,
+    /// 多模态融合配置（字幕 + 检测结果重打分）。
+    /// 默认 None → 不做字幕融合，保持纯音频检测行为不变。
+    pub multimodal: Option<MultimodalConfig>,
+}
+
+/// 多模态融合配置
+#[derive(Debug, Clone, Default)]
+pub struct MultimodalConfig {
+    /// 已按文件名匹配并加载好的字幕列表。
+    /// 顺序与 DetectResult.ranges 对齐：subs[i] 对应用第 i 个文件的字幕。
+    /// 空 Vec 表示该文件没有字幕（跳过融合）。
+    pub loaded_subtitles: Vec<Vec<crate::core::multimodal::srt::Subtitle>>,
+    /// 融合参数（boost / penalty / keywords）
+    pub fusion_config: crate::core::multimodal::fusion::FusionConfig,
 }
 
 impl DetectOptions {
@@ -64,6 +78,10 @@ impl DetectOptions {
     }
     pub fn with_export_dir<P: Into<PathBuf>>(mut self, dir: P) -> Self {
         self.export_dir = Some(dir.into());
+        self
+    }
+    pub fn with_multimodal(mut self, cfg: MultimodalConfig) -> Self {
+        self.multimodal = Some(cfg);
         self
     }
 }
@@ -418,6 +436,27 @@ where
         );
         for f in &failed {
             eprintln!("  - {}", f);
+        }
+    }
+
+    // ---- 字幕融合（保守 A：不改检测管线，结果重打分） ----
+    #[allow(unused_mut)]
+    let mut fusion_apply_count = 0usize;
+    if let Some(mm) = &opts.multimodal {
+        if !mm.loaded_subtitles.is_empty() {
+            for (i, file_subs) in mm.loaded_subtitles.iter().enumerate() {
+                if i >= ranges.len() || file_subs.is_empty() {
+                    continue;
+                }
+                let file_len = lengths.get(i).copied().unwrap_or(0);
+                crate::core::multimodal::fusion::reweight_ranges(
+                    &mut ranges[i],
+                    file_subs,
+                    &mm.fusion_config,
+                    file_len,
+                );
+                fusion_apply_count += 1;
+            }
         }
     }
 

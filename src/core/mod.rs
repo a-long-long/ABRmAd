@@ -13,5 +13,6 @@ pub mod classify;
 pub mod detect;
 pub mod dsp;
 pub mod matching;
+pub mod multimodal;
 pub mod range;
 pub mod viterbi;

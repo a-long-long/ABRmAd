@@ -55,6 +55,16 @@ enum Commands {
         /// 便于 headless 场景调试和自动化审核。
         #[arg(long)]
         export_debug: Option<PathBuf>,
+
+        /// 字幕目录（自动匹配同名 .srt/.SRT 文件）
+        /// 用于保守 A 策略：检测完后根据字幕关键词重打分。
+        #[arg(long)]
+        srt_dir: Option<PathBuf>,
+
+        /// 自定义关键词（逗号分隔）。默认使用内置商业关键词表。
+        /// 仅在提供 --srt-dir 时生效。
+        #[arg(long, value_delimiter = ',')]
+        keywords: Vec<String>,
     },
 
     /// 裁剪音频文件（根据检测结果）
@@ -132,6 +142,8 @@ pub fn run() -> Result<()> {
             hpss_harm_window,
             hpss_perc_window,
             export_debug,
+            srt_dir,
+            keywords,
         } => cmd_detect(
             &files,
             output.as_ref(),
@@ -139,6 +151,8 @@ pub fn run() -> Result<()> {
             hpss_harm_window,
             hpss_perc_window,
             export_debug.as_ref(),
+            srt_dir.as_ref(),
+            keywords,
         ),
         Commands::Cut {
             input_dir,
@@ -178,6 +192,8 @@ fn cmd_detect(
     hpss_harm_window: Option<usize>,
     hpss_perc_window: Option<usize>,
     export_debug: Option<&PathBuf>,
+    srt_dir: Option<&PathBuf>,
+    keywords: Vec<String>,
 ) -> Result<()> {
     println!("开始检测广告...");
     println!("输入文件数量: {}", files.len());
@@ -229,6 +245,28 @@ fn cmd_detect(
     if let Some(dir) = export_debug {
         opts = opts.with_export_dir(dir);
         println!("Debug 导出: {}", dir.display());
+    }
+    if let Some(srt) = srt_dir {
+        use crate::core::detect::MultimodalConfig;
+        use crate::core::multimodal::fusion::load_subtitles_by_basename;
+        use crate::core::multimodal::fusion::FusionConfig;
+
+        let subs_per_file = load_subtitles_by_basename(files, srt);
+        let matched = subs_per_file.iter().filter(|s| !s.is_empty()).count();
+        if matched == 0 {
+            eprintln!("警告：字幕目录 {} 中没有找到任何匹配文件", srt.display());
+        } else {
+            println!("字幕融合: 启用（匹配 {}/{} 个文件）", matched, files.len());
+        }
+        let fusion_cfg = if keywords.is_empty() {
+            FusionConfig::default()
+        } else {
+            FusionConfig::with_keywords(keywords)
+        };
+        opts = opts.with_multimodal(MultimodalConfig {
+            loaded_subtitles: subs_per_file,
+            fusion_config: fusion_cfg,
+        });
     }
     // 复用同一个进度条，避免每次回调新建导致大量瞬时条
     let pb = progress_bar(1000);
