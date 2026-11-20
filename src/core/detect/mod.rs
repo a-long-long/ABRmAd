@@ -37,7 +37,7 @@ use refine::{fine_tune_multi, viterbi_filter_candidates};
 use scan::check_same_adaptive;
 
 /// 检测选项
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DetectOptions {
     /// 是否启用 HPSS 源分离（分离打击乐轨道后再做检测）
     /// 对带背景音乐的广告段，打击乐轨道匹配更稳定。
@@ -63,6 +63,21 @@ pub struct DetectOptions {
     /// （[FFT, MFCC, Chroma, Stats]），GPU 批量精算保持固定权重不变。
     /// 关闭后退化为固定权重 `[0.40, 0.25, 0.15, 0.20]`。
     pub enable_adaptive_weights: bool,
+}
+
+impl Default for DetectOptions {
+    fn default() -> Self {
+        Self {
+            enable_hpss: false,
+            hpss_params: None,
+            export_dir: None,
+            multimodal: None,
+            enable_vad: false,
+            vad_params: None,
+            viterbi_config: None,
+            enable_adaptive_weights: true,
+        }
+    }
 }
 
 /// 多模态融合配置
