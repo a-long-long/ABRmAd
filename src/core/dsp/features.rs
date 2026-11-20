@@ -449,19 +449,22 @@ fn quality_of_matrix(mat: &Array2<f64>, stride: usize, alpha: f64) -> f64 {
 }
 
 /// 同一矩阵内两个子窗口的余弦相似度
+///
+/// 用行迭代（mat.rows()）来绕开 row-major vs column-major 的内存布局假设，
+/// 避免手写 flat 索引时的 stride 搞错（这曾是一次真实 panic 的根因）。
 fn window_cosine(mat: &Array2<f64>, a: usize, b: usize, w: usize) -> f64 {
-    let cols = mat.ncols();
-    let s = mat.as_slice().unwrap();
-    let wa = mat.nrows();
+    let n = mat.nrows();
+    if a.saturating_add(w) > n || b.saturating_add(w) > n {
+        return 0.0;
+    }
+    let row_iter_a = mat.rows().into_iter().skip(a).take(w);
+    let row_iter_b = mat.rows().into_iter().skip(b).take(w);
+
     let mut dot = 0.0;
     let mut na = 0.0;
     let mut nb = 0.0;
-    for f in 0..w {
-        let ra = (a + f) * wa;
-        let rb = (b + f) * wa;
-        for c in 0..cols {
-            let va = s[ra + c];
-            let vb = s[rb + c];
+    for (ra, rb) in row_iter_a.zip(row_iter_b) {
+        for (va, vb) in ra.iter().zip(rb.iter()) {
             dot += va * vb;
             na += va * va;
             nb += vb * vb;

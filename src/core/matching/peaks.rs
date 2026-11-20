@@ -513,4 +513,28 @@ mod tests {
             assert!(delta_t as usize <= cfg.max_delta_t);
         }
     }
+
+    /// 复现真实音频尺寸（rows=6411, cols=64 → 410304 元素）
+    #[test]
+    fn detect_peaks_realistic_size_6411x64() {
+        let rows = 6411usize;
+        let cols = 64usize;
+        let mut fft = Array2::<f64>::zeros((rows, cols));
+        let mut rng = 0xdeadbeefu64;
+        for t in 0..rows {
+            for f in 0..cols {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1);
+                let noise = ((rng >> 33) as f64 / 0xFFFF_FFFFu64 as f64) * 0.1;
+                let tone = (t as f64 * 0.01 + f as f64 * 0.1).sin() * 0.5;
+                fft[[t, f]] = (tone + noise).abs() + 0.01;
+            }
+        }
+        let cfg = PeakConfig::default();
+        let peaks = detect_peaks(&fft, &cfg);
+        println!("peaks count = {}", peaks.len());
+        let pairs = match_peak_pairs(&peaks, &peaks.clone(), &cfg);
+        println!("peak pairs count = {}", pairs.len());
+    }
 }
