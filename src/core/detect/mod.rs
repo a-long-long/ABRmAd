@@ -58,6 +58,11 @@ pub struct DetectOptions {
     pub vad_params: Option<crate::core::dsp::vad::VadParams>,
     /// Viterbi DP 时序一致性过滤参数；None 时用内部默认值
     pub viterbi_config: Option<ViterbiConfig>,
+    /// 是否启用**自适应特征权重**
+    /// 默认 true：Phase 2 两两比对时根据两文件的 4 路特征质量分动态决定权重
+    /// （[FFT, MFCC, Chroma, Stats]），GPU 批量精算保持固定权重不变。
+    /// 关闭后退化为固定权重 `[0.40, 0.25, 0.15, 0.20]`。
+    pub enable_adaptive_weights: bool,
 }
 
 /// 多模态融合配置
@@ -392,7 +397,15 @@ where
         );
     }
 
-    // Phase 1.5: 三特征常驻 GPU（预算内），供 Phase 2 所有文件对复用
+    // Phase 1.5a: 预计算每文件 4 路特征的可区分度质量分（O(num_files)，可并行）
+    // 质量分用于 Phase 2 两两比对时的自适应融合权重
+    let qualities: Vec<[f64; 4]> = feats
+        .iter()
+        .map(|f| crate::core::dsp::features::feature_quality(f))
+        .collect();
+    let qualities = Arc::new(qualities);
+
+    // Phase 1.5b: 三特征常驻 GPU（预算内），供 Phase 2 所有文件对复用
     // 无 GPU、文件过大或超出显存预算时返回 None，后续自动回退按对上传/CPU
     let gpu_feats = crate::core::matching::gpu::feature_context(&feats, HASH_WINDOW_SIZE);
 
@@ -435,7 +448,15 @@ where
         let filtered_candidates =
             viterbi_filter_candidates(&raw_candidates, opts.viterbi_config.as_ref());
 
-        // 2.4 多特征融合精细调整
+        // 2.4 自适应特征权重：取两文件质量分的几何平均 + softmax
+        // 关闭自适应时回退固定权重 [0.40, 0.25, 0.15, 0.20]
+        let pair_w = crate::core::dsp::features::pair_weights(
+            &qualities[i],
+            &qualities[j],
+            opts.enable_adaptive_weights,
+        );
+
+        // 2.5 多特征融合精细调整
         let pair_links = fine_tune_multi(
             &feats[i],
             &feats[j],
@@ -446,6 +467,7 @@ where
             j,
             &thresholds,
             gpu_feats.as_ref(),
+            &pair_w,
         );
 
         {

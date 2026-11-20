@@ -26,8 +26,11 @@ const BOUNDARY_REFINE_WINDOW: usize = 2;
 const BOUNDARY_REFINE_THRESHOLD: f64 = 0.80;
 /// 边界精修时单侧最多收缩的帧数
 const BOUNDARY_REFINE_MAX_SHIFT: usize = 5;
-/// 多特征融合权重：[FFT, MFCC, Chroma]
-const FEATURE_WEIGHTS: [f64; 3] = [0.50, 0.30, 0.20];
+/// 多特征融合权重：[FFT, MFCC, Chroma, Spectral Stats]
+/// Stats 包含 Centroid/Rolloff/Flux，能捕捉语音 vs 音乐 / 广告 jingle 的差异
+const FEATURE_WEIGHTS: [f64; 4] = [0.40, 0.25, 0.15, 0.20];
+/// GPU 批处理只用前三路（shader 尚未覆盖 Stats），取 FEATURE_WEIGHTS 的前 3 维
+const GPU_FEATURE_WEIGHTS: [f64; 3] = [0.40, 0.25, 0.15];
 
 /// GPU 批量位置搜索的最小配对数：低于此值走 CPU，避免调度开销不划算
 const FUSION_MIN_PAIRS: usize = 512;
@@ -54,6 +57,7 @@ fn best_p1_cpu(
     p1: usize,
     p2: usize,
     len1: usize,
+    weights: &[f64],
 ) -> usize {
     let search_start = p1.saturating_sub(POSITION_SEARCH_RANGE);
     let search_end = (p1 + POSITION_SEARCH_RANGE).min(len1.saturating_sub(HASH_WINDOW_SIZE));
@@ -61,8 +65,7 @@ fn best_p1_cpu(
     let mut best_sim = 0.0f64;
     let mut best = p1;
     for i in search_start..search_end {
-        let sim =
-            features::multi_feature_sim(feat1, feat2, i, p2, HASH_WINDOW_SIZE, &FEATURE_WEIGHTS);
+        let sim = features::multi_feature_sim(feat1, feat2, i, p2, HASH_WINDOW_SIZE, weights);
         if sim > best_sim {
             best_sim = sim;
             best = i;
@@ -114,12 +117,19 @@ fn batch_best_positions(
 
     // 2. 三路特征在同一次 GPU 提交内完成加权融合：
     //    优先用文件级常驻缓冲（每个文件只上传一次），不可用时回退按对上传
+    //    GPU shader 暂不覆盖 Stats 特征，因此单独用 GPU_FEATURE_WEIGHTS（前 3 维）
     let fused = match gpu_feats
-        .and_then(|ctx| ctx.fused_sim(idx1, idx2, &pairs, HASH_WINDOW_SIZE, FEATURE_WEIGHTS))
+        .and_then(|ctx| ctx.fused_sim(idx1, idx2, &pairs, HASH_WINDOW_SIZE, GPU_FEATURE_WEIGHTS))
     {
         Some(v) => v,
         None => {
-            match gpu::fused_feature_sim(feat1, feat2, &pairs, HASH_WINDOW_SIZE, FEATURE_WEIGHTS) {
+            match gpu::fused_feature_sim(
+                feat1,
+                feat2,
+                &pairs,
+                HASH_WINDOW_SIZE,
+                GPU_FEATURE_WEIGHTS,
+            ) {
                 Some(v) => v,
                 None => return out,
             }
@@ -235,6 +245,7 @@ pub(super) fn fine_tune_multi(
     file_idx2: usize,
     thresholds: &Thresholds,
     gpu_feats: Option<&gpu::FeatureContext>,
+    weights: &[f64],
 ) -> Vec<Link> {
     let len1 = feat1.fft.nrows();
     let len2 = feat2.fft.nrows();
@@ -267,7 +278,7 @@ pub(super) fn fine_tune_multi(
         // 位置搜索：优先用批量结果，否则 CPU 精确计算
         let p1 = match batched_best.get(cand_idx).copied().flatten() {
             Some(v) => v,
-            None => best_p1_cpu(feat1, feat2, p1_init, p2, len1),
+            None => best_p1_cpu(feat1, feat2, p1_init, p2, len1, weights),
         };
 
         // 向后扩展
@@ -279,7 +290,7 @@ pub(super) fn fine_tune_multi(
                 p1 + next,
                 p2 + next,
                 FINE_TUNE_WINDOW,
-                &FEATURE_WEIGHTS,
+                weights,
             );
             if sim < ft {
                 break;
@@ -296,7 +307,7 @@ pub(super) fn fine_tune_multi(
                 (p1 as i64 + prev) as usize,
                 (p2 as i64 + prev) as usize,
                 FINE_TUNE_WINDOW,
-                &FEATURE_WEIGHTS,
+                weights,
             );
             if sim < ft {
                 prev += FINE_TUNE_WINDOW as i64 - 1;
@@ -320,7 +331,7 @@ pub(super) fn fine_tune_multi(
                 p1 + check_pos,
                 p2 + check_pos,
                 FINE_TUNE_WINDOW,
-                &FEATURE_WEIGHTS,
+                weights,
             );
             if sim >= BOUNDARY_TIGHTEN_THRESHOLD {
                 break;
@@ -341,7 +352,7 @@ pub(super) fn fine_tune_multi(
                 (p1 as i64 + check_pos) as usize,
                 (p2 as i64 + check_pos) as usize,
                 FINE_TUNE_WINDOW,
-                &FEATURE_WEIGHTS,
+                weights,
             );
             if sim >= BOUNDARY_TIGHTEN_THRESHOLD {
                 break;
@@ -352,7 +363,7 @@ pub(super) fn fine_tune_multi(
         // 记录匹配度，供界面展示与结果文件保存
         let start = (p1 as i64 + prev).max(0) as usize;
         let end = (p1 + next).min(len1);
-        let (start, end) = refine_boundaries(feat1, feat2, p1, p2, start, end);
+        let (start, end) = refine_boundaries(feat1, feat2, p1, p2, start, end, weights);
         if end <= start {
             continue;
         }
@@ -363,7 +374,7 @@ pub(super) fn fine_tune_multi(
         if q2 >= len2 || q2 + span > len2 {
             continue;
         }
-        let score = block_confidence(feat1, feat2, start, q2, span, thresholds);
+        let score = block_confidence(feat1, feat2, start, q2, span, thresholds, weights);
 
         let mut add1 = Range::new_simple(start as i32, end as i32);
         add1.score = score;
@@ -392,6 +403,7 @@ fn refine_boundaries(
     p2: usize,
     start: usize,
     end: usize,
+    weights: &[f64],
 ) -> (usize, usize) {
     let len1 = feat1.fft.nrows();
     let len2 = feat2.fft.nrows();
@@ -416,14 +428,7 @@ fn refine_boundaries(
             break;
         }
         let Some(b) = aligned(s) else { break };
-        let sim = features::multi_feature_sim(
-            feat1,
-            feat2,
-            s,
-            b,
-            BOUNDARY_REFINE_WINDOW,
-            &FEATURE_WEIGHTS,
-        );
+        let sim = features::multi_feature_sim(feat1, feat2, s, b, BOUNDARY_REFINE_WINDOW, weights);
         if sim >= BOUNDARY_REFINE_THRESHOLD {
             break;
         }
@@ -443,7 +448,7 @@ fn refine_boundaries(
                     pos,
                     b,
                     BOUNDARY_REFINE_WINDOW,
-                    &FEATURE_WEIGHTS,
+                    weights,
                 );
                 if sim >= BOUNDARY_REFINE_THRESHOLD {
                     break;
@@ -469,6 +474,7 @@ fn block_confidence(
     q2: usize,
     len: usize,
     thresholds: &Thresholds,
+    weights: &[f64],
 ) -> f64 {
     if len == 0 {
         return 0.0;
@@ -490,7 +496,7 @@ fn block_confidence(
                 start + offset,
                 q2 + offset,
                 window,
-                &FEATURE_WEIGHTS,
+                weights,
             );
             if sim >= ft {
                 matched += sim;
@@ -569,6 +575,7 @@ mod tests {
         let mut fft = Array2::zeros((rows, FREQ_BINS));
         let mut mfcc = Array2::zeros((rows, 13));
         let mut chroma = Array2::zeros((rows, 12));
+        let mut stats = Array2::zeros((rows, 3));
 
         for r in 0..rows {
             let src = match shift {
@@ -587,9 +594,17 @@ mod tests {
             for (k, v) in frame_values(src, 12, 3).into_iter().enumerate() {
                 chroma[[r, k]] = sign * v;
             }
+            for (k, v) in frame_values(src, 3, 4).into_iter().enumerate() {
+                stats[[r, k]] = sign * v;
+            }
         }
 
-        AudioFeatures { fft, mfcc, chroma }
+        AudioFeatures {
+            fft,
+            mfcc,
+            chroma,
+            stats,
+        }
     }
 
     #[test]
@@ -599,7 +614,7 @@ mod tests {
         let feat2 = make_features(500, Some(50), &[149]);
 
         // 区间起点 99 与 file2 的 149 对齐（不相似）→ 应收缩到 100
-        let (s, e) = refine_boundaries(&feat1, &feat2, 100, 150, 99, 201);
+        let (s, e) = refine_boundaries(&feat1, &feat2, 100, 150, 99, 201, &FEATURE_WEIGHTS);
         assert_eq!(s, 100, "起点应向内收缩到第一个高相似度帧");
         assert_eq!(e, 201, "终点本身相似，不应被误收缩");
     }
@@ -636,7 +651,7 @@ mod tests {
             }
 
             assert_eq!(
-                best_p1_cpu(&feat1, &feat2, p1, p2, len1),
+                best_p1_cpu(&feat1, &feat2, p1, p2, len1, &FEATURE_WEIGHTS),
                 expected,
                 "p1={p1} 处 best_p1_cpu 与原始循环不一致"
             );
@@ -700,7 +715,7 @@ mod tests {
         for (idx, &(p1, p2)) in candidates.iter().enumerate() {
             assert_eq!(
                 got[idx],
-                Some(best_p1_cpu(&feat1, &feat2, p1, p2, len1)),
+                Some(best_p1_cpu(&feat1, &feat2, p1, p2, len1, &FEATURE_WEIGHTS)),
                 "候选 {idx} (p1={p1}) 定序结果与 CPU 全扫不一致"
             );
         }
@@ -752,7 +767,7 @@ mod tests {
         for (idx, &(p1, p2)) in candidates.iter().enumerate() {
             assert_eq!(
                 got[idx],
-                Some(best_p1_cpu(&feat1, &feat2, p1, p2, len1)),
+                Some(best_p1_cpu(&feat1, &feat2, p1, p2, len1, &FEATURE_WEIGHTS)),
                 "候选 {idx} (p1={p1}) 在 f32 扰动下定序结果偏离 CPU 全扫"
             );
         }
@@ -775,7 +790,7 @@ mod tests {
 
         let batched = batch_best_positions(&feat1, &feat2, &candidates, 1200, 1300, None, 0, 1);
         for (i, &(p1, p2)) in candidates.iter().enumerate() {
-            let cpu = best_p1_cpu(&feat1, &feat2, p1, p2, 1200);
+            let cpu = best_p1_cpu(&feat1, &feat2, p1, p2, 1200, &FEATURE_WEIGHTS);
             match batched[i] {
                 Some(gpu) => assert_eq!(gpu, cpu, "候选 {i} (p1={p1}) GPU 与 CPU 结果不一致"),
                 // None 表示该候选已被判为"f32 定序不可靠"，由调用方回退 CPU，
