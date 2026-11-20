@@ -151,10 +151,20 @@ pub(crate) fn start_detection(state: &SharedState) {
                 s.is_processing = false;
                 s.status_message = format!("检测失败: {}", e);
             }
-            Err(_) => {
+            Err(payload) => {
+                let bt = std::backtrace::Backtrace::force_capture();
+                let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "(未知 panic payload)".to_string()
+                };
+                let full = format!("检测 panic: {msg}\n{bt}");
+                eprintln!("{full}");
                 let mut s = state.lock().unwrap();
                 s.is_processing = false;
-                s.status_message = "检测线程发生 panic（已恢复）".to_string();
+                s.status_message = full;
             }
         }
     });

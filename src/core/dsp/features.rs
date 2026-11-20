@@ -396,8 +396,13 @@ pub fn feature_quality(feat: &AudioFeatures) -> [f64; 4] {
     let q_mfcc = quality_of_matrix(&feat.mfcc, 25, ALPHA).max(MIN_QUALITY);
     let q_chroma = quality_of_matrix(&feat.chroma, 25, ALPHA).max(MIN_QUALITY);
     // stats 只取 centroid / rolloff 两列（Flux 是帧间差，和"自相似"定义冲突）
-    let stats_subset = feat.stats.slice(ndarray::s![.., 0..2]).to_owned();
-    let q_stats = quality_of_matrix(&stats_subset, 25, ALPHA).max(MIN_QUALITY);
+    // 防御：stats 列数不足 2 时回退 MIN_QUALITY（不应发生，但以防手动构造的 AudioFeatures）
+    let q_stats = if feat.stats.ncols() >= 2 {
+        let stats_subset = feat.stats.slice(ndarray::s![.., 0..2]).to_owned();
+        quality_of_matrix(&stats_subset, 25, ALPHA).max(MIN_QUALITY)
+    } else {
+        MIN_QUALITY
+    };
 
     [q_fft, q_mfcc, q_chroma, q_stats]
 }

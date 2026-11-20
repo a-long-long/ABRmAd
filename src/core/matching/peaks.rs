@@ -201,11 +201,11 @@ fn rolling_max_2d(a: &Array2<f64>, t_neigh: usize, f_neigh: usize) -> Array2<f64
             let col = a.column(f);
             let mut q: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
             for t in 0..rows {
-                while !q.is_empty() && col[t] >= col[*q.back().unwrap()] {
+                while !q.is_empty() && col[t] >= col[*q.back().unwrap_or(&t)] {
                     q.pop_back();
                 }
                 q.push_back(t);
-                if q.front().copied().unwrap() + w <= t {
+                if q.front().copied().unwrap_or(0) + w <= t {
                     q.pop_front();
                 }
                 // 窗口右边界 = t，左边界 = t - w + 1
@@ -239,11 +239,11 @@ fn rolling_max_2d(a: &Array2<f64>, t_neigh: usize, f_neigh: usize) -> Array2<f64
             let row = buf.row(t);
             let mut q: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
             for f in 0..cols {
-                while !q.is_empty() && row[f] >= row[*q.back().unwrap()] {
+                while !q.is_empty() && row[f] >= row[*q.back().unwrap_or(&f)] {
                     q.pop_back();
                 }
                 q.push_back(f);
-                if q.front().copied().unwrap() + w <= f {
+                if q.front().copied().unwrap_or(0) + w <= f {
                     q.pop_front();
                 }
                 let center = f.saturating_sub(f_neigh);
