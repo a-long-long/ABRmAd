@@ -235,4 +235,61 @@ mod tests {
             "E:/音乐/广告 1.mp3"
         );
     }
+
+    /// 检测路径的音频解码统一经过 ffmpeg，支持列表里每个容器都应能转成 WAV
+    #[test]
+    fn audio_to_wav_supports_all_supported_formats() {
+        if !check_ffmpeg() {
+            eprintln!("FFmpeg 未安装，跳过测试");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("abrmad_fmt_decode_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 与 pipeline::SUPPORTED_EXTENSIONS 一一对应
+        let cases: &[(&str, &[&str])] = &[
+            ("mp3", &["-c:a", "libmp3lame"]),
+            ("wav", &[]),
+            ("flac", &["-c:a", "flac"]),
+            ("m4a", &["-c:a", "aac"]),
+            ("aac", &["-c:a", "aac", "-f", "adts"]),
+            ("ogg", &["-c:a", "libvorbis"]),
+            ("opus", &["-c:a", "libopus"]),
+            ("wma", &["-c:a", "wmav2"]),
+        ];
+
+        for (ext, codec) in cases {
+            let sample = dir.join(format!("sample.{ext}"));
+            // 本机 ffmpeg 缺少该编码器时跳过，不算失败
+            let encoded = Command::new(FFMPEG_PATH)
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                ])
+                .arg("sine=frequency=440:duration=2")
+                .args(*codec)
+                .arg(&sample)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !encoded {
+                eprintln!("本机 ffmpeg 缺少 {ext} 编码器，跳过该格式");
+                continue;
+            }
+
+            let wav = dir.join(format!("decoded_{ext}.wav"));
+            audio_to_wav(&sample, &wav).unwrap_or_else(|e| panic!("{ext} 解码为 WAV 失败: {e:#}"));
+            let len = std::fs::metadata(&wav).unwrap().len();
+            assert!(len > 1000, "{ext} 转出的 WAV 太小（{len} 字节）");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
