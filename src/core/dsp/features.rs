@@ -1,6 +1,6 @@
 //! 多特征提取模块
 //!
-//! 从 FFT 频谱图提取 MFCC 和 Chroma（色度）特征，
+//! 从 FFT 频谱图提取 MFCC、Chroma（色度）和频谱统计特征，
 //! 与原始频谱特征融合以提高广告识别准确率。
 //!
 //! 频率参数直接复用 [`crate::core::dsp::fft`] 的常量，避免与实际频谱图不一致。
@@ -20,8 +20,11 @@ const N_MELS: usize = 26;
 pub const MEL_BANDS: usize = N_MELS;
 /// 色度特征 bin 数量（12 个音级）
 const N_CHROMA: usize = 12;
+/// 频谱统计特征数量（centroid, rolloff, flux）
+pub const N_STATS: usize = 3;
 
 /// 多特征集合
+#[derive(Debug, Clone)]
 pub struct AudioFeatures {
     /// 原始 FFT 频谱图 (n_frames, FREQ_BINS)
     pub fft: Array2<f64>,
@@ -29,16 +32,23 @@ pub struct AudioFeatures {
     pub mfcc: Array2<f64>,
     /// Chroma 色度特征 (n_frames, N_CHROMA)
     pub chroma: Array2<f64>,
+    /// 频谱统计特征 (n_frames, N_STATS)
+    /// - col 0: Spectral Centroid（谱质心，单位 Hz）
+    /// - col 1: Spectral Rolloff（95% 能量处的频率，单位 Hz）
+    /// - col 2: Spectral Flux（与上一帧的 L2 距离）
+    pub stats: Array2<f64>,
 }
 
 /// 从 FFT 频谱图提取全部特征
 pub fn extract_features(fft: &Array2<f64>) -> AudioFeatures {
     let mfcc = compute_mfcc_features(fft);
     let chroma = compute_chroma_features(fft);
+    let stats = compute_spectral_stats(fft);
     AudioFeatures {
         fft: fft.clone(),
         mfcc,
         chroma,
+        stats,
     }
 }
 
@@ -203,29 +213,116 @@ fn compute_chroma_features(fft: &Array2<f64>) -> Array2<f64> {
     chroma
 }
 
+/// 计算频谱统计特征（Centroid / Rolloff / Flux）
+///
+/// 三个特征都是基于频谱能量的：
+/// - **Spectral Centroid（谱质心）**：能量加权的"重心"频率。语音 ≈ 300-800Hz，
+///   音乐可到 2-5kHz，打击乐更高。
+/// - **Spectral Rolloff**：95% 能量集中处的频率。广告 jingle 常有独特的滚降模式。
+/// - **Spectral Flux**：相邻帧频谱的 L2 距离。检测瞬态变化（广告开始/结束点）。
+fn compute_spectral_stats(fft: &Array2<f64>) -> Array2<f64> {
+    let n_frames = fft.nrows();
+    let n_freq = fft.ncols();
+    let sample_rate = SAMPLE_RATE as f64;
+    let mut stats = Array2::zeros((n_frames, N_STATS));
+
+    // 预计算每个 bin 对应的物理频率（Hz）
+    let bin_hz: Vec<f64> = (0..n_freq)
+        .map(|k| k as f64 * sample_rate / N_FFT as f64)
+        .collect();
+
+    // 95% 能量用于 Rolloff
+    const ROLLOFF_THRESHOLD: f64 = 0.95;
+
+    let mut prev_pows: Option<Vec<f64>> = None;
+
+    for frame in 0..n_frames {
+        let spectrum = fft.row(frame);
+
+        let mut total_energy = 0.0f64;
+        let mut weighted_sum = 0.0f64;
+        let mut cumulative = 0.0f64;
+        let mut centroid = 0.0f64;
+        let mut rolloff_hz = 0.0f64;
+        let mut pows = Vec::with_capacity(n_freq);
+
+        for k in 0..n_freq {
+            let pow = spectrum[k] * spectrum[k];
+            pows.push(pow);
+            total_energy += pow;
+            weighted_sum += bin_hz[k] * pow;
+        }
+
+        if total_energy > 1e-10 {
+            centroid = weighted_sum / total_energy;
+            // Rolloff: 找到累加能量首次达到 95% total_energy 的 bin 位置
+            let target = total_energy * ROLLOFF_THRESHOLD;
+            for k in 0..n_freq {
+                cumulative += pows[k];
+                if cumulative >= target {
+                    rolloff_hz = bin_hz[k];
+                    break;
+                }
+            }
+        }
+
+        // Flux: 与上一帧的 L2 距离
+        let flux = match &prev_pows {
+            Some(prev) => {
+                let mut d = 0.0f64;
+                for k in 0..n_freq {
+                    let diff = (pows[k] - prev[k]).max(0.0); // 只计上升沿（标准 flux 定义）
+                    d += diff * diff;
+                }
+                d.sqrt()
+            }
+            None => 0.0,
+        };
+        prev_pows = Some(pows);
+
+        stats[[frame, 0]] = centroid;
+        stats[[frame, 1]] = rolloff_hz;
+        stats[[frame, 2]] = flux;
+    }
+
+    stats
+}
+
 /// 多特征加权余弦相似度
 ///
-/// 分别计算 FFT、MFCC、Chroma 三个特征的余弦相似度，
-/// 然后按权重加权求和。
+/// 分别计算 FFT、MFCC、Chroma 以及可选的频谱统计特征（Centroid/Rolloff/Flux）
+/// 的余弦相似度，然后按权重加权求和。
 ///
 /// # 参数
 /// - `feat1`, `feat2`: 两个文件的特征集
 /// - `offset1`, `offset2`: 各自起始帧
 /// - `size`: 比较窗口帧数
-/// - `weights`: [fft_weight, mfcc_weight, chroma_weight]，建议 [0.5, 0.3, 0.2]
+/// - `weights`: 权重切片，按顺序 [fft, mfcc, chroma]，可选第 4 个为 stats
+///              建议 3 维: [0.5, 0.3, 0.2]；4 维: [0.40, 0.25, 0.15, 0.20]
 pub fn multi_feature_sim(
     feat1: &AudioFeatures,
     feat2: &AudioFeatures,
     offset1: usize,
     offset2: usize,
     size: usize,
-    weights: &[f64; 3],
+    weights: &[f64],
 ) -> f64 {
+    let w0 = weights.get(0).copied().unwrap_or(0.0);
+    let w1 = weights.get(1).copied().unwrap_or(0.0);
+    let w2 = weights.get(2).copied().unwrap_or(0.0);
+    let w3 = weights.get(3).copied().unwrap_or(0.0);
+
     let fft_sim = sim_matrix(&feat1.fft, &feat2.fft, offset1, offset2, size);
     let mfcc_sim = sim_matrix(&feat1.mfcc, &feat2.mfcc, offset1, offset2, size);
     let chroma_sim = sim_matrix(&feat1.chroma, &feat2.chroma, offset1, offset2, size);
 
-    weights[0] * fft_sim + weights[1] * mfcc_sim + weights[2] * chroma_sim
+    let stats_sim = if w3 > 0.0 && feat1.stats.nrows() > 0 && feat2.stats.nrows() > 0 {
+        sim_matrix(&feat1.stats, &feat2.stats, offset1, offset2, size)
+    } else {
+        0.0
+    };
+
+    w0 * fft_sim + w1 * mfcc_sim + w2 * chroma_sim + w3 * stats_sim
 }
 
 /// 两个矩阵指定窗口的余弦相似度
@@ -274,6 +371,141 @@ fn sim_matrix(
     } else {
         dot / denom
     }
+}
+
+// ---------------------------------------------------------------------------
+// 自适应权重：特征质量评估
+// ---------------------------------------------------------------------------
+
+/// 估计 AudioFeatures 四路特征在该文件上的**可区分度**分数
+///
+/// 对每路特征矩阵 X ∈ R^{n_frames × n_cols}：
+/// 1. 每隔 stride 帧取一个 anchor，算它与后续窗口的**帧间余弦相似度**分布
+/// 2. 质量分数 = 均值 + α × 标准差（稳定 + 有差异 → 高分）
+/// 3. 最后把分数 clip 到 `[MIN_QUALITY, 1.0]`，避免某路完全坍塌为 0
+///
+/// 返回 `[q_fft, q_mfcc, q_chroma, q_stats]`，每项 ∈ [0.1, 1.0]
+///
+/// 这个质量分用于 Phase 2 两两比对时做自适应权重：
+/// `pair_weights[k] = softmax( sqrt(q_k(i) * q_k(j)) )`
+pub fn feature_quality(feat: &AudioFeatures) -> [f64; 4] {
+    const MIN_QUALITY: f64 = 0.1; // 保底，不让某路权重为 0
+    const ALPHA: f64 = 0.5; // std 的系数，平衡"稳定"与"有差异"
+
+    let q_fft = quality_of_matrix(&feat.fft, 25, ALPHA).max(MIN_QUALITY);
+    let q_mfcc = quality_of_matrix(&feat.mfcc, 25, ALPHA).max(MIN_QUALITY);
+    let q_chroma = quality_of_matrix(&feat.chroma, 25, ALPHA).max(MIN_QUALITY);
+    // stats 只取 centroid / rolloff 两列（Flux 是帧间差，和"自相似"定义冲突）
+    let stats_subset = feat.stats.slice(ndarray::s![.., 0..2]).to_owned();
+    let q_stats = quality_of_matrix(&stats_subset, 25, ALPHA).max(MIN_QUALITY);
+
+    [q_fft, q_mfcc, q_chroma, q_stats]
+}
+
+/// 计算单路特征矩阵的质量分
+///
+/// 用 "anchor-vs-neighbors" 自相似度分布来估计：
+/// 每隔 stride 帧取一个 anchor，算它前后各 W 帧范围内的窗口余弦相似度。
+/// 注意：**不含 anchor 自己**（自己和自己相似度恒为 1，会扭曲均值）。
+fn quality_of_matrix(mat: &Array2<f64>, stride: usize, alpha: f64) -> f64 {
+    const MIN_QUALITY: f64 = 0.1; // 保底，不让某路权重为 0
+
+    let n = mat.nrows();
+    let w = 8.min(n.max(1) / 20); // 比较窗口长度
+    if n < w * 2 {
+        return MIN_QUALITY;
+    }
+
+    // 收集所有 anchor-vs-neighbor 的窗口余弦相似度
+    let mut sims: Vec<f64> = Vec::with_capacity((n / stride).max(1) * 6);
+
+    // anchor 必须能放下 w + 3*w 的后续邻居窗口
+    for anchor in (0..=n.saturating_sub(w + 3 * w)).step_by(stride.max(1)) {
+        // 和后续几个邻居窗口比
+        for nb in [anchor + w, anchor + 2 * w, anchor + 3 * w] {
+            let sim = window_cosine(mat, anchor, nb, w);
+            if sim.is_finite() {
+                sims.push(sim);
+            }
+        }
+    }
+
+    if sims.len() < 4 {
+        return MIN_QUALITY;
+    }
+
+    let m = sims.iter().sum::<f64>() / sims.len() as f64;
+    let v = sims.iter().map(|s| (s - m).powi(2)).sum::<f64>() / sims.len() as f64;
+    let std = v.sqrt();
+
+    // 归一化：均值高说明稳定，std 高说明片段间差异明显（匹配时更可靠）
+    let score = (m + alpha * std).clamp(0.0, 1.0);
+    score
+}
+
+/// 同一矩阵内两个子窗口的余弦相似度
+fn window_cosine(mat: &Array2<f64>, a: usize, b: usize, w: usize) -> f64 {
+    let cols = mat.ncols();
+    let s = mat.as_slice().unwrap();
+    let wa = mat.nrows();
+    let mut dot = 0.0;
+    let mut na = 0.0;
+    let mut nb = 0.0;
+    for f in 0..w {
+        let ra = (a + f) * wa;
+        let rb = (b + f) * wa;
+        for c in 0..cols {
+            let va = s[ra + c];
+            let vb = s[rb + c];
+            dot += va * vb;
+            na += va * va;
+            nb += vb * vb;
+        }
+    }
+    let d = (na * nb).sqrt();
+    if d < 1e-8 {
+        0.0
+    } else {
+        dot / d
+    }
+}
+
+/// 两文件质量分 → 跨文件对齐权重
+///
+/// 对每路 k：`sqrt(q_k(i) * q_k(j))` 取两文件质量的几何平均
+/// （避免单向低分拖累，但也不让单向高分掩盖问题），
+/// 再过 softmax 做概率归一化，温度 = 0.5 让分布更尖锐。
+///
+/// 如果 `adaptive == false`，直接返回固定权重。
+pub fn pair_weights(qi: &[f64; 4], qj: &[f64; 4], adaptive: bool) -> [f64; 4] {
+    if !adaptive {
+        return [0.40, 0.25, 0.15, 0.20];
+    }
+
+    // 几何平均
+    let mut geom = [0.0f64; 4];
+    for k in 0..4 {
+        geom[k] = (qi[k] * qj[k]).sqrt();
+    }
+
+    // softmax，温度 τ = 0.5（让分高的特征权重差距拉开）
+    const TAU: f64 = 0.5;
+    let mx = geom.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut exps = [0.0f64; 4];
+    let mut total = 0.0f64;
+    for k in 0..4 {
+        exps[k] = ((geom[k] - mx) / TAU).exp();
+        total += exps[k];
+    }
+
+    if total < 1e-10 {
+        return [0.25; 4];
+    }
+    let mut out = [0.0f64; 4];
+    for k in 0..4 {
+        out[k] = exps[k] / total;
+    }
+    out
 }
 
 #[cfg(test)]

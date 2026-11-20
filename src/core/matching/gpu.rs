@@ -1641,7 +1641,14 @@ mod tests {
         let mfcc =
             Array2::from_shape_fn((rows, 13), |(i, j)| ((i * 5 + j * 2) as f64 * seed).cos());
         let chroma = Array2::from_shape_fn((rows, 12), |(i, j)| ((i * 3 + j) as f64 * seed).sin());
-        crate::core::dsp::features::AudioFeatures { fft, mfcc, chroma }
+        let stats =
+            Array2::from_shape_fn((rows, 3), |(i, j)| ((i * 11 + j * 5) as f64 * seed).sin());
+        crate::core::dsp::features::AudioFeatures {
+            fft,
+            mfcc,
+            chroma,
+            stats,
+        }
     }
 
     /// 与融合 shader 逐行对应的 f32 模型（不依赖 GPU）

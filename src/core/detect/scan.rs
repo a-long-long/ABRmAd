@@ -10,6 +10,7 @@ use ndarray::Array2;
 
 use crate::core::matching::gpu;
 use crate::core::matching::lsh;
+use crate::core::matching::peaks;
 
 use super::Thresholds;
 use super::HASH_WINDOW_SIZE;
@@ -17,7 +18,18 @@ use super::HASH_WINDOW_SIZE;
 /// 单对文件交给 GPU 的最大候选数，超出后回退 CPU 以控制显存与内存
 const MAX_GPU_PAIRS: usize = 4_000_000;
 
-/// 自适应阈值 + 多探针 LSH 候选匹配
+/// Wang 峰值辅助指纹配置
+const WANG_PEAK_CONFIG: peaks::PeakConfig = peaks::PeakConfig {
+    freq_neigh: 3,
+    time_neigh: 4,
+    magnitude_floor: 0.0,
+    target_peaks_per_sec: 5,
+    min_delta_t: 10,
+    max_delta_t: 50,
+    max_targets_per_anchor: 5,
+};
+
+/// 自适应阈值 + 多探针 LSH + Wang 峰值辅助候选匹配
 pub(super) fn check_same_adaptive(
     fft1: &Array2<f64>,
     fft2: &Array2<f64>,
@@ -37,6 +49,12 @@ pub(super) fn check_same_adaptive(
     };
 
     let mut best_per_frame = best_matches(fft1, fft2, &groups, gpu_used);
+
+    // ---- Wang/Shazam 风格的频谱峰值辅助候选 ----
+    // 对 LSH 漏检的相似片段补召回：LSH 基于全局随机投影，对局部窄带特征可能不敏感，
+    // 而 Wang 峰值只编码频率 bin 间的相对关系，正好互补。
+    // 候选去重后直接算 f64 余弦相似度加入列表。
+    merge_wang_peak_candidates(&mut best_per_frame, fft1, fft2);
 
     let all_scores: Vec<f64> = best_per_frame
         .iter()
@@ -62,6 +80,52 @@ pub(super) fn check_same_adaptive(
         .into_iter()
         .filter(|&(_, _, sim)| sim >= adaptive_threshold)
         .collect()
+}
+
+/// 把 Wang 峰值候选合并进 best_per_frame
+///
+/// - 用 Wang 匹配的候选 (t1, t2) 去重：LSH 已覆盖的锚点位置不重复加入
+/// - Wang 候选帧位置直接算 f64 余弦相似度
+/// - 最终按帧位置升序
+fn merge_wang_peak_candidates(
+    best_per_frame: &mut Vec<(usize, usize, f64)>,
+    fft1: &Array2<f64>,
+    fft2: &Array2<f64>,
+) {
+    // Wang 匹配候选
+    let peaks1 = peaks::detect_peaks(fft1, &WANG_PEAK_CONFIG);
+    let peaks2 = peaks::detect_peaks(fft2, &WANG_PEAK_CONFIG);
+    let wang_candidates = peaks::match_peak_pairs(&peaks1, &peaks2, &WANG_PEAK_CONFIG);
+    if wang_candidates.is_empty() {
+        return;
+    }
+
+    // LSH 已覆盖的 file1 帧位置集合（采样帧，步长 HASH_WINDOW_SIZE）
+    let lsh_covered: std::collections::HashSet<usize> =
+        best_per_frame.iter().map(|&(t1, _, _)| t1).collect();
+
+    let mut extra = Vec::with_capacity(wang_candidates.len());
+    for (t1, t2) in wang_candidates {
+        // 必须能容纳完整 HASH_WINDOW_SIZE
+        if t1 + HASH_WINDOW_SIZE > fft1.nrows() || t2 + HASH_WINDOW_SIZE > fft2.nrows() {
+            continue;
+        }
+        // 跳过 LSH 已经覆盖的锚点位置（避免同一帧重复）
+        if lsh_covered.contains(&t1) {
+            continue;
+        }
+        let sim = lsh::cosine_sim(fft1, fft2, t1, t2, HASH_WINDOW_SIZE);
+        if sim >= 0.0 {
+            extra.push((t1, t2, sim));
+        }
+    }
+
+    if extra.is_empty() {
+        return;
+    }
+
+    best_per_frame.extend(extra);
+    best_per_frame.sort_by_key(|&(t1, _, _)| t1);
 }
 
 /// GPU 粗筛后交给 CPU f64 精算的候选上限
