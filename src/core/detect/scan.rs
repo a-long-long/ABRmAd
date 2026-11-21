@@ -54,7 +54,7 @@ pub(super) fn check_same_adaptive(
     // 对 LSH 漏检的相似片段补召回：LSH 基于全局随机投影，对局部窄带特征可能不敏感，
     // 而 Wang 峰值只编码频率 bin 间的相对关系，正好互补。
     // 候选去重后直接算 f64 余弦相似度加入列表。
-    merge_wang_peak_candidates(&mut best_per_frame, fft1, fft2);
+    merge_wang_peak_candidates(&mut best_per_frame, fft1, fft2, thresholds);
 
     let all_scores: Vec<f64> = best_per_frame
         .iter()
@@ -91,6 +91,7 @@ fn merge_wang_peak_candidates(
     best_per_frame: &mut Vec<(usize, usize, f64)>,
     fft1: &Array2<f64>,
     fft2: &Array2<f64>,
+    thresholds: &Thresholds,
 ) {
     // Wang 匹配候选
     let peaks1 = peaks::detect_peaks(fft1, &WANG_PEAK_CONFIG);
@@ -115,7 +116,9 @@ fn merge_wang_peak_candidates(
             continue;
         }
         let sim = lsh::cosine_sim(fft1, fft2, t1, t2, HASH_WINDOW_SIZE);
-        if sim >= 0.0 {
+        // 只接受达到粗筛下限的候选：补召回不能引入低相似度的噪声起点，
+        // 否则大量弱候选会拉低自适应阈值并产生超长假阳性区间。
+        if sim >= thresholds.min_threshold {
             extra.push((t1, t2, sim));
         }
     }

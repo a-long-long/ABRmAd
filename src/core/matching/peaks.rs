@@ -523,9 +523,7 @@ mod tests {
         let mut rng = 0xdeadbeefu64;
         for t in 0..rows {
             for f in 0..cols {
-                rng = rng
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1);
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
                 let noise = ((rng >> 33) as f64 / 0xFFFF_FFFFu64 as f64) * 0.1;
                 let tone = (t as f64 * 0.01 + f as f64 * 0.1).sin() * 0.5;
                 fft[[t, f]] = (tone + noise).abs() + 0.01;

@@ -316,13 +316,98 @@ pub fn multi_feature_sim(
     let mfcc_sim = sim_matrix(&feat1.mfcc, &feat2.mfcc, offset1, offset2, size);
     let chroma_sim = sim_matrix(&feat1.chroma, &feat2.chroma, offset1, offset2, size);
 
+    // stats 三列（质心/滚降/Flux）都是非负量，直接算余弦会在任意两段无关音频
+    // 间得到 ≈0.98 的虚高相似度。必须先去均值（Pearson 相关）再算余弦。
     let stats_sim = if w3 > 0.0 && feat1.stats.nrows() > 0 && feat2.stats.nrows() > 0 {
-        sim_matrix(&feat1.stats, &feat2.stats, offset1, offset2, size)
+        sim_matrix_centered(&feat1.stats, &feat2.stats, offset1, offset2, size).max(0.0)
     } else {
         0.0
     };
 
     w0 * fft_sim + w1 * mfcc_sim + w2 * chroma_sim + w3 * stats_sim
+}
+
+/// 两文件在指定窗口内的核心特征相似度 `(fft_sim, mfcc_sim)`
+///
+/// 用于区间扩展的硬约束：真实重复片段必须在频谱包络（FFT）与音色（MFCC）
+/// 上同时相似，避免某一虚高特征单独撑住权重和而让区间无限延长。
+pub fn core_feature_sim(
+    feat1: &AudioFeatures,
+    feat2: &AudioFeatures,
+    offset1: usize,
+    offset2: usize,
+    size: usize,
+) -> (f64, f64) {
+    (
+        sim_matrix(&feat1.fft, &feat2.fft, offset1, offset2, size),
+        sim_matrix(&feat1.mfcc, &feat2.mfcc, offset1, offset2, size),
+    )
+}
+
+/// 去均值余弦（Pearson 相关）相似度
+///
+/// 与 [`sim_matrix`] 的区别：先在窗口内逐列减去均值，再做余弦。
+/// 对质心、滚降频率这类"全为正、量级相近"的特征，普通余弦几乎恒为 1，
+/// 看不出内容差异；去均值后才能反映真实的相关性。
+fn sim_matrix_centered(
+    a: &Array2<f64>,
+    b: &Array2<f64>,
+    offset_a: usize,
+    offset_b: usize,
+    size: usize,
+) -> f64 {
+    if offset_a >= a.nrows() || offset_b >= b.nrows() {
+        return 0.0;
+    }
+    let width = a.ncols().min(b.ncols());
+    let actual_size = size.min(a.nrows() - offset_a).min(b.nrows() - offset_b);
+    if actual_size == 0 || width == 0 {
+        return 0.0;
+    }
+    let a_w = a.ncols();
+    let b_w = b.ncols();
+    let a_slice = a.as_slice().unwrap();
+    let b_slice = b.as_slice().unwrap();
+
+    // 第一遍：逐列求均值
+    let mut mean_a = vec![0.0f64; width];
+    let mut mean_b = vec![0.0f64; width];
+    for frame in 0..actual_size {
+        let a_off = (offset_a + frame) * a_w;
+        let b_off = (offset_b + frame) * b_w;
+        for k in 0..width {
+            mean_a[k] += a_slice[a_off + k];
+            mean_b[k] += b_slice[b_off + k];
+        }
+    }
+    let inv = 1.0 / actual_size as f64;
+    for k in 0..width {
+        mean_a[k] *= inv;
+        mean_b[k] *= inv;
+    }
+
+    // 第二遍：去均值后累加点积与模长
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    for frame in 0..actual_size {
+        let a_off = (offset_a + frame) * a_w;
+        let b_off = (offset_b + frame) * b_w;
+        for k in 0..width {
+            let va = a_slice[a_off + k] - mean_a[k];
+            let vb = b_slice[b_off + k] - mean_b[k];
+            dot += va * vb;
+            na += va * va;
+            nb += vb * vb;
+        }
+    }
+
+    let denom = (na * nb).sqrt();
+    if denom < 1e-12 {
+        0.0
+    } else {
+        dot / denom
+    }
 }
 
 /// 两个矩阵指定窗口的余弦相似度
@@ -395,16 +480,38 @@ pub fn feature_quality(feat: &AudioFeatures) -> [f64; 4] {
     let q_fft = quality_of_matrix(&feat.fft, 25, ALPHA).max(MIN_QUALITY);
     let q_mfcc = quality_of_matrix(&feat.mfcc, 25, ALPHA).max(MIN_QUALITY);
     let q_chroma = quality_of_matrix(&feat.chroma, 25, ALPHA).max(MIN_QUALITY);
-    // stats 只取 centroid / rolloff 两列（Flux 是帧间差，和"自相似"定义冲突）
+    // stats 只取 centroid / rolloff 两列（Flux 是帧间差，和"自相似"定义冲突）。
+    // 必须先逐列去均值：这两列都是非负量，不去均值时自相似度恒接近 1，
+    // 会让 stats 的质量分虚高、进而被 softmax 放大权重。
     // 防御：stats 列数不足 2 时回退 MIN_QUALITY（不应发生，但以防手动构造的 AudioFeatures）
     let q_stats = if feat.stats.ncols() >= 2 {
-        let stats_subset = feat.stats.slice(ndarray::s![.., 0..2]).to_owned();
+        let stats_subset = center_columns(&feat.stats.slice(ndarray::s![.., 0..2]).to_owned());
         quality_of_matrix(&stats_subset, 25, ALPHA).max(MIN_QUALITY)
     } else {
         MIN_QUALITY
     };
 
     [q_fft, q_mfcc, q_chroma, q_stats]
+}
+
+/// 逐列减去该列均值（原地生成新矩阵）
+fn center_columns(mat: &Array2<f64>) -> Array2<f64> {
+    let (rows, cols) = mat.dim();
+    let mut out = mat.clone();
+    if rows == 0 {
+        return out;
+    }
+    for c in 0..cols {
+        let mut sum = 0.0f64;
+        for r in 0..rows {
+            sum += mat[[r, c]];
+        }
+        let mean = sum / rows as f64;
+        for r in 0..rows {
+            out[[r, c]] -= mean;
+        }
+    }
+    out
 }
 
 /// 计算单路特征矩阵的质量分
@@ -513,7 +620,21 @@ pub fn pair_weights(qi: &[f64; 4], qj: &[f64; 4], adaptive: bool) -> [f64; 4] {
     for k in 0..4 {
         out[k] = exps[k] / total;
     }
-    out
+
+    // 约束投影：stats（第 4 路）判别力有限，权重不超过 0.25；
+    // 主频谱 FFT（第 1 路）是匹配基石，权重不低于 0.30。
+    // 剩余权重按 MFCC / Chroma 的原比例分摊，保证总和为 1。
+    let stats_w = out[3].min(0.25);
+    let fft_w = out[0].max(0.30).min(1.0 - stats_w);
+    let rest = (1.0 - fft_w - stats_w).max(0.0);
+    let mfcc_chroma = out[1] + out[2];
+    let (mfcc_w, chroma_w) = if mfcc_chroma > 1e-12 {
+        (rest * out[1] / mfcc_chroma, rest * out[2] / mfcc_chroma)
+    } else {
+        // 原比例缺失时按固定权重 0.25:0.15 分摊
+        (rest * 0.625, rest * 0.375)
+    };
+    [fft_w, mfcc_w, chroma_w, stats_w]
 }
 
 #[cfg(test)]
@@ -563,5 +684,55 @@ mod tests {
         let feat = extract_features(&fft);
         let sim = multi_feature_sim(&feat, &feat, 0, 0, 20, &[0.5, 0.3, 0.2]);
         assert!((sim - 1.0).abs() < 0.01, "identical sim = {}", sim);
+    }
+
+    /// 回归：stats 三列都是非负量，普通余弦在无关片段间恒接近 1。
+    /// 修复后必须走"去均值余弦"，无关内容得分应显著偏低。
+    #[test]
+    fn stats_similarity_not_inflated_for_unrelated_content() {
+        let rows = 200usize;
+        // 两段无关的"质心/滚降"序列：量级相同（都是 1000~3000Hz），形状无关
+        let mut a = Array2::<f64>::zeros((rows, 2));
+        let mut b = Array2::<f64>::zeros((rows, 2));
+        let mut rng = 12345u64;
+        for t in 0..rows {
+            for c in 0..2 {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let noise = ((rng >> 33) as f64 / 0xFFFF_FFFFu64 as f64) - 0.5;
+                a[[t, c]] = 2000.0 + noise * 400.0;
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let noise2 = ((rng >> 33) as f64 / 0xFFFF_FFFFu64 as f64) - 0.5;
+                b[[t, c]] = 2000.0 + noise2 * 400.0;
+            }
+        }
+
+        let raw = sim_matrix(&a, &b, 0, 0, 50);
+        let centered = sim_matrix_centered(&a, &b, 0, 0, 50);
+
+        // 普通余弦虚高到 0.9 以上（这正是之前的 bug 来源）
+        assert!(raw > 0.85, "raw cosine should be inflated, got {}", raw);
+        // 去均值后应接近 0
+        assert!(
+            centered.abs() < 0.35,
+            "centered cosine should be low for unrelated content, got {}",
+            centered
+        );
+    }
+
+    /// 回归：自适应权重不能让 stats 权重过大、FFT 权重过小
+    #[test]
+    fn pair_weights_clamped() {
+        // 构造 stats 质量远高于其他三路的情形
+        let qi = [0.1, 0.1, 0.1, 1.0];
+        let qj = [0.1, 0.1, 0.1, 1.0];
+        let w = pair_weights(&qi, &qj, true);
+        assert!(w[3] <= 0.26, "stats weight should be capped, got {:?}", w);
+        assert!(w[0] >= 0.30, "fft weight should have a floor, got {:?}", w);
+        let sum: f64 = w.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-9,
+            "weights must sum to 1, got {}",
+            sum
+        );
     }
 }

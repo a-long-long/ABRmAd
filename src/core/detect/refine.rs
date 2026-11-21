@@ -26,6 +26,13 @@ const BOUNDARY_REFINE_WINDOW: usize = 2;
 const BOUNDARY_REFINE_THRESHOLD: f64 = 0.80;
 /// 边界精修时单侧最多收缩的帧数
 const BOUNDARY_REFINE_MAX_SHIFT: usize = 5;
+
+/// 区间扩展时核心特征（FFT 频谱 + MFCC 音色）各自必须达到的最低相似度
+///
+/// 只用加权和判据时，任何一路特征的虚高得分都能把总和撑到阈值之上，
+/// 导致匹配区间一路延长（曾出现几百秒的"相同片段"）。真实重复片段
+/// 必须在主频谱与音色上同时相似，因此这里对两路都设硬下限。
+const EXTEND_CORE_MIN: f64 = 0.55;
 /// 多特征融合权重：[FFT, MFCC, Chroma, Spectral Stats]
 /// Stats 包含 Centroid/Rolloff/Flux，能捕捉语音 vs 音乐 / 广告 jingle 的差异
 const FEATURE_WEIGHTS: [f64; 4] = [0.40, 0.25, 0.15, 0.20];
@@ -233,6 +240,20 @@ pub(super) fn viterbi_filter_candidates(
     }
 }
 
+/// 核心特征是否同时达标（FFT 频谱 + MFCC 音色）
+///
+/// 用于区间扩展的硬约束，防止单一特征的虚高得分把匹配区间拉长。
+fn core_features_agree(
+    feat1: &AudioFeatures,
+    feat2: &AudioFeatures,
+    offset1: usize,
+    offset2: usize,
+) -> bool {
+    let (fft_sim, mfcc_sim) =
+        features::core_feature_sim(feat1, feat2, offset1, offset2, FINE_TUNE_WINDOW);
+    fft_sim >= EXTEND_CORE_MIN && mfcc_sim >= EXTEND_CORE_MIN
+}
+
 /// 多特征融合精细调整
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fine_tune_multi(
@@ -292,7 +313,7 @@ pub(super) fn fine_tune_multi(
                 FINE_TUNE_WINDOW,
                 weights,
             );
-            if sim < ft {
+            if sim < ft || !core_features_agree(feat1, feat2, p1 + next, p2 + next) {
                 break;
             }
             next += FINE_TUNE_STEP;
@@ -309,7 +330,14 @@ pub(super) fn fine_tune_multi(
                 FINE_TUNE_WINDOW,
                 weights,
             );
-            if sim < ft {
+            if sim < ft
+                || !core_features_agree(
+                    feat1,
+                    feat2,
+                    (p1 as i64 + prev) as usize,
+                    (p2 as i64 + prev) as usize,
+                )
+            {
                 prev += FINE_TUNE_WINDOW as i64 - 1;
                 break;
             }
