@@ -219,7 +219,12 @@ fn compute_chroma_features(fft: &Array2<f64>) -> Array2<f64> {
 /// - **Spectral Centroid（谱质心）**：能量加权的"重心"频率。语音 ≈ 300-800Hz，
 ///   音乐可到 2-5kHz，打击乐更高。
 /// - **Spectral Rolloff**：95% 能量集中处的频率。广告 jingle 常有独特的滚降模式。
-/// - **Spectral Flux**：相邻帧频谱的 L2 距离。检测瞬态变化（广告开始/结束点）。
+/// - **Spectral Flux**：相邻帧归一化功率谱的 L2 距离。检测瞬态变化（广告开始/结束点）。
+///
+/// 归一化策略（对码率 / 音量不敏感）：
+/// 1. Centroid / Rolloff 取 `log2(1+Hz)`，近似人耳对数频率感知并压缩动态范围
+/// 2. Flux 在能量归一化的功率谱上计算，只反映频谱形状变化
+/// 3. 三列各自 z-score（均值 0、标准差 1），保证在余弦相似度中贡献均衡
 fn compute_spectral_stats(fft: &Array2<f64>) -> Array2<f64> {
     let n_frames = fft.nrows();
     let n_freq = fft.ncols();
@@ -266,12 +271,21 @@ fn compute_spectral_stats(fft: &Array2<f64>) -> Array2<f64> {
             }
         }
 
-        // Flux: 与上一帧的 L2 距离
+        // 归一化功率谱（能量和 = 1）：让 Flux 只反映频谱"形状"变化，
+        // 与音量、码率带来的整体能量差异无关。
+        if total_energy > 1e-10 {
+            for p in pows.iter_mut() {
+                *p /= total_energy;
+            }
+        }
+
+        // Flux: 与上一帧的 L2 距离（只计上升沿，标准定义）。
+        // 在归一化功率谱上计算，因此对整体音量完全不敏感。
         let flux = match &prev_pows {
             Some(prev) => {
                 let mut d = 0.0f64;
                 for k in 0..n_freq {
-                    let diff = (pows[k] - prev[k]).max(0.0); // 只计上升沿（标准 flux 定义）
+                    let diff = (pows[k] - prev[k]).max(0.0);
                     d += diff * diff;
                 }
                 d.sqrt()
@@ -280,12 +294,47 @@ fn compute_spectral_stats(fft: &Array2<f64>) -> Array2<f64> {
         };
         prev_pows = Some(pows);
 
-        stats[[frame, 0]] = centroid;
-        stats[[frame, 1]] = rolloff_hz;
+        // Centroid / Rolloff 取 log2(1+Hz)：频率感知近似对数刻度，
+        // 压缩动态范围，避免个别高频帧主导相似度。
+        stats[[frame, 0]] = (centroid + 1.0).log2();
+        stats[[frame, 1]] = (rolloff_hz + 1.0).log2();
         stats[[frame, 2]] = flux;
     }
 
+    // 逐列 z-score：三列量纲不同（log 频率 vs 相对通量），
+    // 不做标准化时方差大的列会主导余弦相似度。标准化后三列等权。
+    normalize_stats(&mut stats);
     stats
+}
+
+/// 统计特征逐列 z-score 归一化（均值 0、标准差 1）
+///
+/// 常数列（标准差 ≈ 0）直接置零，避免除零并让该列在相似度计算中不产生贡献。
+fn normalize_stats(stats: &mut Array2<f64>) {
+    let n = stats.nrows();
+    if n < 2 {
+        return;
+    }
+    for c in 0..stats.ncols() {
+        let mean = (0..n).map(|r| stats[[r, c]]).sum::<f64>() / n as f64;
+        let var = (0..n)
+            .map(|r| {
+                let d = stats[[r, c]] - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / n as f64;
+        let std = var.sqrt();
+        if std > 1e-12 {
+            for r in 0..n {
+                stats[[r, c]] = (stats[[r, c]] - mean) / std;
+            }
+        } else {
+            for r in 0..n {
+                stats[[r, c]] = 0.0;
+            }
+        }
+    }
 }
 
 /// 多特征加权余弦相似度
@@ -481,9 +530,9 @@ pub fn feature_quality(feat: &AudioFeatures) -> [f64; 4] {
     let q_mfcc = quality_of_matrix(&feat.mfcc, 25, ALPHA).max(MIN_QUALITY);
     let q_chroma = quality_of_matrix(&feat.chroma, 25, ALPHA).max(MIN_QUALITY);
     // stats 只取 centroid / rolloff 两列（Flux 是帧间差，和"自相似"定义冲突）。
-    // 必须先逐列去均值：这两列都是非负量，不去均值时自相似度恒接近 1，
-    // 会让 stats 的质量分虚高、进而被 softmax 放大权重。
-    // 防御：stats 列数不足 2 时回退 MIN_QUALITY（不应发生，但以防手动构造的 AudioFeatures）
+    // extract_features 已对 stats 做过逐列 z-score，这里再居中一次作为防御，
+    // 避免外部手工构造的 AudioFeatures 绕过归一化后质量分虚高。
+    // 防御：stats 列数不足 2 时回退 MIN_QUALITY
     let q_stats = if feat.stats.ncols() >= 2 {
         let stats_subset = center_columns(&feat.stats.slice(ndarray::s![.., 0..2]).to_owned());
         quality_of_matrix(&stats_subset, 25, ALPHA).max(MIN_QUALITY)
@@ -734,5 +783,56 @@ mod tests {
             "weights must sum to 1, got {}",
             sum
         );
+    }
+
+    /// 构造一段有频谱变化的测试 FFT
+    fn make_varying_fft(rows: usize) -> Array2<f64> {
+        let mut fft = Array2::<f64>::zeros((rows, FREQ_BINS));
+        for t in 0..rows {
+            for k in 0..FREQ_BINS {
+                let tone = ((t as f64 * 0.13) + (k as f64 * 0.37)).sin().abs();
+                let band = 1.0 / (1.0 + (k as f64 - 10.0).abs());
+                fft[[t, k]] = tone * band + 0.01;
+            }
+        }
+        fft
+    }
+
+    /// stats 三列必须完成 z-score：均值 ≈ 0、标准差 ≈ 1
+    #[test]
+    fn stats_columns_are_zscored() {
+        let fft = make_varying_fft(300);
+        let feat = extract_features(&fft);
+        for c in 0..feat.stats.ncols() {
+            let col = feat.stats.column(c);
+            let n = col.len() as f64;
+            let mean = col.sum() / n;
+            let var = col.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+            let std = var.sqrt();
+            assert!(mean.abs() < 1e-9, "col {} mean = {}", c, mean);
+            assert!((std - 1.0).abs() < 1e-6, "col {} std = {}", c, std);
+        }
+    }
+
+    /// stats 必须对整体音量不敏感：频谱整体放大 3 倍后特征应完全一致
+    #[test]
+    fn stats_invariant_to_volume_scaling() {
+        let fft = make_varying_fft(200);
+        let scaled = &fft * 3.0;
+        let a = extract_features(&fft);
+        let b = extract_features(&scaled);
+        for t in 0..a.stats.nrows() {
+            for c in 0..a.stats.ncols() {
+                let d = (a.stats[[t, c]] - b.stats[[t, c]]).abs();
+                assert!(
+                    d < 1e-6,
+                    "stats differ at ({}, {}): {} vs {}",
+                    t,
+                    c,
+                    a.stats[[t, c]],
+                    b.stats[[t, c]]
+                );
+            }
+        }
     }
 }
