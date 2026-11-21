@@ -234,7 +234,10 @@ pub(super) fn viterbi_filter_candidates(
     let default = viterbi::ViterbiConfig {
         max_drift: 3,
         max_lookback: 200,
-        min_chain_score: 2.5,
+        // 改用平均分判据：短片段不再被绝对累计分误杀，
+        // 长链也不能靠数量堆分通过
+        min_chain_score: 0.0,
+        min_chain_avg_score: 0.60,
         min_chain_length: 2,
     };
     let config = cfg.unwrap_or(&default);

@@ -140,7 +140,7 @@ fn show_viterbi(ui: &mut egui::Ui, viterbi: &mut Option<ViterbiConfig>) -> bool 
     ui.horizontal(|ui| {
         changed |= ui
             .checkbox(&mut custom, "自定义 Viterbi 参数")
-            .on_hover_text("关闭则使用内部默认值（max_drift=3, min_chain_score=2.5）")
+            .on_hover_text("关闭则使用内部默认值（max_drift=3, 最小平均得分=0.60）")
             .changed();
     });
 
@@ -171,6 +171,21 @@ fn show_viterbi(ui: &mut egui::Ui, viterbi: &mut Option<ViterbiConfig>) -> bool 
                     .changed();
                 ui.end_row();
 
+                ui.label("最小平均得分");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut cfg.min_chain_avg_score)
+                            .range(0.0..=1.0)
+                            .speed(0.01)
+                            .fixed_decimals(2),
+                    )
+                    .on_hover_text(
+                        "链内每个匹配点的平均相似度下限，随链长自适应；\
+                         比固定累计分更公平（0 表示不启用）",
+                    )
+                    .changed();
+                ui.end_row();
+
                 ui.label("最小累计得分");
                 changed |= ui
                     .add(
@@ -179,7 +194,7 @@ fn show_viterbi(ui: &mut egui::Ui, viterbi: &mut Option<ViterbiConfig>) -> bool 
                             .speed(0.1)
                             .fixed_decimals(1),
                     )
-                    .on_hover_text("保留链的最低累计相似度得分，越高越严格")
+                    .on_hover_text("绝对累计相似度下限，0 表示只用平均分判据")
                     .changed();
                 ui.end_row();
             });
@@ -194,7 +209,8 @@ fn cfg_from_refine_default() -> ViterbiConfig {
     ViterbiConfig {
         max_drift: 3,
         max_lookback: 200,
-        min_chain_score: 2.5,
+        min_chain_score: 0.0,
+        min_chain_avg_score: 0.60,
         min_chain_length: 2,
     }
 }

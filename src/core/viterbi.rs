@@ -18,8 +18,15 @@ pub struct ViterbiConfig {
     pub max_drift: usize,
     /// 向前搜索的最大跨度（帧）
     pub max_lookback: usize,
-    /// 保留链的最小累计得分
+    /// 保留链的最小累计得分（0 表示不启用，仅用平均分判据）
     pub min_chain_score: f64,
+    /// 保留链的最小**平均**得分：累计得分 / 链长（0 表示不启用）
+    ///
+    /// 绝对累计分对长短片段并不公平：2 帧即使两帧都完美相似也只能得 2.0，
+    /// 达不到固定下限就被整条丢弃；反之长链可以靠数量堆出很高的累计分，
+    /// 即使每一帧都只是勉强过线。平均分判据随链长自适应——短链看质量，
+    /// 长链必须整体保持质量，兼顾召回与抗噪。
+    pub min_chain_avg_score: f64,
     /// 保留链的最小匹配数量
     pub min_chain_length: usize,
 }
@@ -29,10 +36,29 @@ impl Default for ViterbiConfig {
         Self {
             max_drift: 3,
             max_lookback: 200,
-            min_chain_score: 3.0,
+            // 默认改用平均分判据：累计分下限关闭
+            min_chain_score: 0.0,
+            min_chain_avg_score: 0.60,
             min_chain_length: 3,
         }
     }
+}
+
+/// 链是否达标：长度 + 累计分（可选）+ 平均分（可选），三个条件同时满足
+///
+/// `min_chain_avg_score > 0` 时要求 `dp / chain_len >= min_chain_avg_score`，
+/// 即每个匹配点的平均相似度必须达标；链越长，该要求施加的"惩罚"越大。
+fn chain_passes(config: &ViterbiConfig, dp: f64, chain_len: usize) -> bool {
+    if chain_len < config.min_chain_length {
+        return false;
+    }
+    if config.min_chain_score > 0.0 && dp < config.min_chain_score {
+        return false;
+    }
+    if config.min_chain_avg_score > 0.0 && dp < config.min_chain_avg_score * chain_len as f64 {
+        return false;
+    }
+    true
 }
 
 /// 候选数低于该阈值时直接走 O(n²) 实现，桶结构的固定开销不划算
@@ -119,7 +145,7 @@ where
         if keep[k] {
             continue;
         }
-        if dp[k] >= config.min_chain_score && chain_len[k] >= config.min_chain_length {
+        if chain_passes(config, dp[k], chain_len[k]) {
             let mut cur = Some(k);
             while let Some(c) = cur {
                 if keep[c] {
@@ -301,7 +327,7 @@ mod tests {
 
         let mut keep = vec![false; n];
         for k in 0..n {
-            if dp[k] >= config.min_chain_score && chain_len[k] >= config.min_chain_length {
+            if chain_passes(config, dp[k], chain_len[k]) {
                 let mut cur = Some(k);
                 while let Some(c) = cur {
                     keep[c] = true;
@@ -343,6 +369,8 @@ mod tests {
                 max_drift: 3,
                 max_lookback: 40,
                 min_chain_score: 2.0,
+                // 本用例只验证两种实现等价，关闭平均分判据以保持原判据
+                min_chain_avg_score: 0.0,
                 min_chain_length: 2,
             };
 
@@ -444,6 +472,64 @@ mod tests {
         let config = ViterbiConfig::default();
         let result = viterbi_filter(&candidates, &config);
         assert!(result.is_empty());
+    }
+
+    /// 生成一条偏移恒定的链
+    fn chain(n: usize, score: f64) -> Vec<Candidate> {
+        (0..n)
+            .map(|i| Candidate {
+                pos1: i * 2,
+                pos2: i * 2,
+                score,
+            })
+            .collect()
+    }
+
+    /// 短链（2 帧）只要每帧质量高就应通过：旧的绝对累计分判据会整条丢弃
+    #[test]
+    fn short_chain_passes_by_average_score() {
+        let candidates = chain(2, 0.8);
+        let config = ViterbiConfig {
+            min_chain_score: 0.0,
+            min_chain_avg_score: 0.60,
+            min_chain_length: 2,
+            ..Default::default()
+        };
+        let result = viterbi_filter(&candidates, &config);
+        assert_eq!(result.len(), 2, "2 帧 × 0.8，平均 0.8 应通过");
+    }
+
+    /// 长链靠数量堆出的累计分不够：平均分不达标必须整条拒绝
+    #[test]
+    fn long_mediocre_chain_rejected_by_average_score() {
+        let candidates = chain(20, 0.4); // 累计 8.0，平均 0.4
+        let config = ViterbiConfig {
+            min_chain_score: 0.0,
+            min_chain_avg_score: 0.60,
+            min_chain_length: 2,
+            ..Default::default()
+        };
+        let result = viterbi_filter(&candidates, &config);
+        assert!(
+            result.is_empty(),
+            "平均分 0.4 < 0.6，累计分再高也应拒绝，实际保留 {} 个",
+            result.len()
+        );
+    }
+
+    /// 显式设置绝对累计分下限时仍然生效
+    #[test]
+    fn absolute_chain_score_still_applies() {
+        let config = ViterbiConfig {
+            min_chain_score: 5.0,
+            min_chain_avg_score: 0.0, // 关闭平均分，只看累计分
+            min_chain_length: 2,
+            ..Default::default()
+        };
+        let pass = viterbi_filter(&chain(20, 0.4), &config); // 累计 8.0 ≥ 5.0
+        assert!(!pass.is_empty());
+        let fail = viterbi_filter(&chain(3, 0.5), &config); // 累计 1.5 < 5.0
+        assert!(fail.is_empty());
     }
 
     #[test]
