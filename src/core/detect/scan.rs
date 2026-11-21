@@ -133,10 +133,31 @@ fn merge_wang_peak_candidates(
 
 /// GPU 粗筛后交给 CPU f64 精算的候选上限
 ///
-/// 每个帧组最多精确复算 TOP_RECHECK 个候选。GPU f32 排序通常与 CPU f64
-/// 排序一致，但在近优候选之间可能因精度差异错位；8 个足以覆盖实际场景
-/// 中所有可能的排名扰动，又避免了极端情况下退化为逐对全量复算。
-const TOP_RECHECK: usize = 8;
+/// 每个帧组最多精确复算的候选数不再固定：GPU f32 排序通常与 CPU f64
+/// 排序一致，但在近优候选之间可能因精度差异错位。组内候选少时全部复算；
+/// 候选多时按比例扩大复算范围（长音频/重复内容会让同一哈希命中更多位置），
+/// 但设置上限以保证开销可控。
+const TOP_RECHECK_MIN: usize = 8;
+
+/// 每个帧组最多精确复算的候选数上限（开销上限）
+const TOP_RECHECK_MAX: usize = 32;
+
+/// 组内候选较多时按 `n / 该值` 扩大复算范围
+const TOP_RECHECK_DIVISOR: usize = 16;
+
+/// 组内候选的复算预算：随组内候选数自适应
+///
+/// - `n <= TOP_RECHECK_MIN`：全部复算（小桶无近似风险）
+/// - 否则：按 `n / TOP_RECHECK_DIVISOR` 增长，夹在 `[MIN, MAX]` 之间
+///
+/// 用组内候选数而不是文件长度作为代理：同一哈希命中的位置越多，
+/// 说明该内容在文件中重复越多，越需要更大范围才能覆盖真正的最优候选。
+fn recheck_budget(n: usize) -> usize {
+    if n <= TOP_RECHECK_MIN {
+        return n;
+    }
+    (n / TOP_RECHECK_DIVISOR).clamp(TOP_RECHECK_MIN, TOP_RECHECK_MAX)
+}
 
 /// CPU 候选生成：HashMap 分桶 + 多探针查找
 ///
@@ -226,9 +247,9 @@ fn gpu_best_matches_recheck(
         let (i, positions) = groups.group(g);
         let n = positions.len();
 
-        // 按 GPU f32 分数降序取前 TOP_RECHECK 个候选索引
+        // 按 GPU f32 分数降序取前 K 个候选索引（K 随组内候选数自适应）
         let mut ranked: Vec<usize> = (0..n).collect();
-        let take = TOP_RECHECK.min(n);
+        let take = recheck_budget(n);
         // 用 partial sort（前 take 个有序），避免全量排序。
         // take == n 时全部候选入选，且 select_nth 的索引会越界 panic，必须跳过。
         if take < n {
@@ -290,6 +311,27 @@ mod tests {
     use super::*;
     use ndarray::Array2;
     use std::sync::atomic::AtomicBool;
+
+    /// 复算预算随组内候选数增长，且有上下界
+    #[test]
+    fn recheck_budget_adapts_to_group_size() {
+        // 小桶全部复算
+        assert_eq!(recheck_budget(1), 1);
+        assert_eq!(recheck_budget(8), 8);
+        // 略超小桶下限时仍按最小预算（不减少）
+        assert_eq!(recheck_budget(9), TOP_RECHECK_MIN);
+        assert_eq!(recheck_budget(200), 12); // 200 / 16 = 12
+        assert_eq!(recheck_budget(1024), TOP_RECHECK_MAX); // 64 → 上限 32
+                                                           // 单调不减，且永不超过上限与组内候选数
+        let mut prev = 0;
+        for n in 1..5000 {
+            let b = recheck_budget(n);
+            assert!(b >= prev, "budget must be non-decreasing at n={}", n);
+            assert!(b <= n, "budget must not exceed group size at n={}", n);
+            assert!(b <= TOP_RECHECK_MAX, "budget must be capped at n={}", n);
+            prev = b;
+        }
+    }
 
     /// 构造有多个近优候选的测试场景
     ///
@@ -396,9 +438,9 @@ mod tests {
     }
 
     /// GPU 分数和 CPU 分数的数值本身有差异（这是预期的 f32/f64 差异），
-    /// 但排序前 8 个候选里应包含 CPU 真正最优的那个
+    /// 但自适应复算预算覆盖的候选里应包含 CPU 真正最优的那个
     #[test]
-    fn gpu_top8_always_contains_cpu_best() {
+    fn gpu_topk_always_contains_cpu_best() {
         if gpu::backend_name().is_none() {
             eprintln!("未检测到可用 GPU，跳过");
             return;
@@ -426,20 +468,21 @@ mod tests {
                 .map(|(off, sim)| (off, sim))
                 .unwrap();
 
-            // GPU 按 f32 分数排序的 top-8 索引
+            // GPU 按 f32 分数排序的 top-K 索引（K 随组内候选数自适应）
             let mut ranked: Vec<usize> = (0..n).collect();
-            let take = TOP_RECHECK.min(n);
-            ranked.select_nth_unstable_by(take, |&a, &b| {
-                let sa = scores[k + a];
-                let sb = scores[k + b];
-                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            ranked.truncate(take);
+            let take = recheck_budget(n);
+            if take < n {
+                ranked.select_nth_unstable_by(take, |&a, &b| {
+                    let sa = scores[k + a];
+                    let sb = scores[k + b];
+                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                ranked.truncate(take);
+            }
 
-            // CPU 最优的位置索引应该在 GPU top-8 里
-            let in_top8 = ranked.contains(&cpu_best_pos);
+            // CPU 最优的位置索引应该在 GPU top-K 里
             assert!(
-                in_top8,
+                ranked.contains(&cpu_best_pos),
                 "group i={i}: CPU best pos index {cpu_best_pos} NOT in GPU top-{take}, ranked={ranked:?}"
             );
 
