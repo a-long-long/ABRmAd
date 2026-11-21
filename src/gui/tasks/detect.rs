@@ -176,7 +176,11 @@ pub(crate) fn select_all_ads(state: &SharedState) {
 
     for (file_idx, file) in s.files.iter().enumerate() {
         if file.detected {
-            for ad_idx in 0..file.effective_ad_count(th) {
+            for (ad_idx, r) in file.effective_ads(th).enumerate() {
+                // 超长区间只作候选：批量全选时跳过，避免误删长篇内容
+                if th.is_overlong(r) {
+                    continue;
+                }
                 selected.push((file_idx, ad_idx));
             }
         }

@@ -75,6 +75,17 @@ fn show_thresholds(ui: &mut egui::Ui, th: &mut Thresholds) -> bool {
                 .changed();
             ui.end_row();
 
+            ui.label("最大广告长度");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut th.max_length_sec)
+                        .range(0..=3600)
+                        .suffix(" 秒"),
+                )
+                .on_hover_text("0 表示不限制；超过上限的区间仍会显示，但全选时跳过，需人工确认")
+                .changed();
+            ui.end_row();
+
             ui.label("最小出现次数");
             changed |= ui
                 .add(egui::DragValue::new(&mut th.min_count).range(2..=10))

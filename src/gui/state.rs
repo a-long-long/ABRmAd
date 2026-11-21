@@ -60,6 +60,9 @@ impl MatchMode {
 pub struct Thresholds {
     /// 最小广告长度（秒），0 表示不限制
     pub min_length_sec: i32,
+    /// 合理广告长度上限（秒），0 表示不限制
+    /// 超过上限的区间仍会显示，但"全选"时跳过，需人工确认
+    pub max_length_sec: i32,
     /// 最小出现次数
     pub min_count: i32,
     /// 极高匹配度阈值
@@ -74,6 +77,7 @@ impl Default for Thresholds {
     fn default() -> Self {
         Self {
             min_length_sec: 0,
+            max_length_sec: 300,
             min_count: 2,
             score_top: 0.9,
             score_high: 0.8,
@@ -95,6 +99,15 @@ impl Thresholds {
             }
         }
         true
+    }
+
+    /// 区间是否超出合理广告时长（"全选"时跳过，只作候选）
+    pub fn is_overlong(&self, r: &Range) -> bool {
+        if self.max_length_sec <= 0 {
+            return false;
+        }
+        let secs = r.end.saturating_sub(r.begin) as f64 / 10.0;
+        secs > self.max_length_sec as f64
     }
 }
 
@@ -293,6 +306,21 @@ pub type SharedState = Arc<Mutex<AppState>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 超过最大长度的区间应被识别为"候选"（全选时跳过）
+    #[test]
+    fn thresholds_detect_overlong_ranges() {
+        let th = Thresholds::default(); // max_length_sec = 300
+        assert!(
+            !th.is_overlong(&Range::new(0, 3000, 2)),
+            "正好 300 秒不算超限"
+        );
+        assert!(th.is_overlong(&Range::new(0, 3001, 2)), "300.1 秒应超限");
+
+        let mut unlimited = Thresholds::default();
+        unlimited.max_length_sec = 0;
+        assert!(!unlimited.is_overlong(&Range::new(0, 999_999, 2)));
+    }
 
     #[test]
     fn match_mode_classifies_scores() {

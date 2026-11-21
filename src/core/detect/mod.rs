@@ -63,6 +63,10 @@ pub struct DetectOptions {
     /// （[FFT, MFCC, Chroma, Stats]），GPU 批量精算保持固定权重不变。
     /// 关闭后退化为固定权重 `[0.40, 0.25, 0.15, 0.20]`。
     pub enable_adaptive_weights: bool,
+    /// 合理广告时长上限（秒），0 表示不限制。
+    /// 超过该时长的区间不会丢弃（可能是专题片/连续剧片头），
+    /// 但匹配度会被压到低置信度区间，作为"候选"交由人工确认。
+    pub max_ad_duration_sec: f64,
 }
 
 impl Default for DetectOptions {
@@ -76,6 +80,7 @@ impl Default for DetectOptions {
             vad_params: None,
             viterbi_config: None,
             enable_adaptive_weights: true,
+            max_ad_duration_sec: 300.0,
         }
     }
 }
@@ -534,6 +539,17 @@ where
         *r = compress_range(r);
     }
 
+    // 5. 超长区间降级为候选
+    if opts.max_ad_duration_sec > 0.0 {
+        let downgraded = downgrade_overlong_ranges(&mut ranges, opts.max_ad_duration_sec);
+        if downgraded > 0 {
+            eprintln!(
+                "提示：{} 个区间的时长超过 {} 秒，已降级为低置信度候选",
+                downgraded, opts.max_ad_duration_sec
+            );
+        }
+    }
+
     let lengths: Vec<usize> = ffts.iter().map(|f| f.nrows()).collect();
 
     if !failed.is_empty() {
@@ -590,6 +606,35 @@ where
             None
         },
     })
+}
+
+/// FFT 帧率：STEP = 2205 @ 22050Hz → 0.1 秒/帧
+const FRAMES_PER_SEC: f64 = 10.0;
+
+/// 超长区间降级后的匹配度上限（低于界面默认低置信度阈值 0.60）
+const SUSPECT_SCORE_CAP: f64 = 0.35;
+
+/// 把时长超过 `max_sec` 的区间降级为低置信度候选
+///
+/// 广告不可能长达数百秒；但直接丢弃可能误伤专题片、连续剧片头等
+/// "确实重复出现的长片段"。因此只压低匹配度、不删除区间。
+///
+/// 返回被降级的区间数量。
+fn downgrade_overlong_ranges(ranges: &mut [Vec<Range>], max_sec: f64) -> usize {
+    if max_sec <= 0.0 {
+        return 0;
+    }
+    let max_frames = (max_sec * FRAMES_PER_SEC) as i32;
+    let mut count = 0usize;
+    for file_ranges in ranges.iter_mut() {
+        for r in file_ranges.iter_mut() {
+            if r.end - r.begin > max_frames {
+                r.score = r.score.min(SUSPECT_SCORE_CAP);
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// 在 FFT 幅度矩阵上做 VAD 标记，将静音窗口对应的 hash 置为 VAD_SILENCE_MARKER
@@ -796,6 +841,47 @@ mod tests {
         assert_eq!(t.min_threshold, 0.45);
         assert_eq!(t.max_threshold, 0.80);
         assert_eq!(t.fine_tune_threshold, 0.65);
+    }
+
+    /// 超长区间只降级（压低匹配度）不删除；max_sec=0 表示不限制
+    #[test]
+    fn overlong_ranges_are_downgraded_not_dropped() {
+        let mut ranges = vec![vec![
+            Range {
+                begin: 0,
+                end: 2000, // 200 秒
+                count: 2,
+                type_id: 0,
+                score: 0.95,
+            },
+            Range {
+                begin: 0,
+                end: 5000, // 500 秒，超限
+                count: 2,
+                type_id: 0,
+                score: 0.95,
+            },
+        ]];
+
+        let n = downgrade_overlong_ranges(&mut ranges, 300.0);
+        assert_eq!(n, 1, "只应降级 1 个超长区间");
+        assert_eq!(ranges[0].len(), 2, "超长区间不能被删除");
+        assert!(
+            (ranges[0][0].score - 0.95).abs() < 1e-9,
+            "未超限区间不受影响"
+        );
+        assert!(ranges[0][1].score <= SUSPECT_SCORE_CAP);
+
+        // 0 表示不限制
+        let mut unlimited = vec![vec![Range {
+            begin: 0,
+            end: 99_999,
+            count: 2,
+            type_id: 0,
+            score: 0.9,
+        }]];
+        assert_eq!(downgrade_overlong_ranges(&mut unlimited, 0.0), 0);
+        assert!((unlimited[0][0].score - 0.9).abs() < 1e-9);
     }
 
     /// thresholds_for 的保守策略只在 flatness > 0.6 时提升阈值
