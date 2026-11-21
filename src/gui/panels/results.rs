@@ -148,7 +148,7 @@ pub(crate) fn handle_track_click(
     ctx: &Context,
     state: &SharedState,
     file_idx: usize,
-    effective_ads: &[&crate::core::range::Range],
+    effective_ads: &[&abrmad_core::range::Range],
     bar_rect: egui::Rect,
     file_len: f32,
     response: &egui::Response,

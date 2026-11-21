@@ -2,7 +2,7 @@
 
 #[cfg(feature = "cli")]
 fn main() -> anyhow::Result<()> {
-    abrmad_rs::cli::run()
+    abrmad_rs_app::cli::run()
 }
 
 #[cfg(not(feature = "cli"))]

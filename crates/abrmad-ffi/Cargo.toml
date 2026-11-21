@@ -1,0 +1,19 @@
+[package]
+name = "abrmad-ffi"
+version = "0.1.0"
+edition = "2021"
+
+# 产物文件名即 lib 名：Windows 为 abrmad_rs.dll，Linux 为 libabrmad_rs.so
+[lib]
+name = "abrmad_rs"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[features]
+# GPU 加速（默认关闭，按需 --features gpu）
+gpu = ["abrmad-core/gpu"]
+
+[dependencies]
+abrmad-core = { path = "../abrmad-core" }
+abrmad-audio = { path = "../abrmad-audio" }
+libc = "0.2"

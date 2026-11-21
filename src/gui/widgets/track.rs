@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use egui::{self, Context};
 
-use crate::core::detect::reverse_range;
+use abrmad_core::detect::reverse_range;
 
 use super::super::panels::results::handle_track_click;
 use super::super::state::{FileInfo, SharedState};
@@ -46,7 +46,7 @@ pub(crate) fn draw_file_track(
     label_colors: &HashMap<String, egui::Color32>,
 ) {
     let file_len = file.length as f32;
-    let effective_ads: Vec<&crate::core::range::Range> = file.effective_ads(thresholds).collect();
+    let effective_ads: Vec<&abrmad_core::range::Range> = file.effective_ads(thresholds).collect();
     let event_ranges = &file.event_ranges;
 
     // 剩余时长按实际会被裁剪的段（已标记删除）计算，与保存结果保持一致
@@ -249,7 +249,7 @@ pub(crate) fn draw_file_track(
 fn draw_event_track(
     ui: &mut egui::Ui,
     file_len: f32,
-    events: &[crate::core::classify::EventRange],
+    events: &[abrmad_core::classify::EventRange],
     label_colors: &HashMap<String, egui::Color32>,
 ) {
     let bar_width = ui.available_width();

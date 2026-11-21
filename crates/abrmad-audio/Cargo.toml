@@ -1,0 +1,18 @@
+[package]
+name = "abrmad-audio"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "abrmad_audio"
+path = "src/lib.rs"
+
+[dependencies]
+# 矩阵运算（缓存读写）
+ndarray = "0.16"
+
+# 临时文件名随机后缀
+rand = "0.8"
+
+# 错误处理
+anyhow = "1.0"

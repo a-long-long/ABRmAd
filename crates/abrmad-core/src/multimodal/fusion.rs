@@ -8,8 +8,8 @@
 //! 2. 区间完全在无字幕覆盖的静音段 → score × silence_penalty（默认 0.7）
 //! 3. 区间时间范围 0 或 score 已为 0 → 不做改动
 
-use crate::core::multimodal::srt::Subtitle;
-use crate::core::range::Range;
+use crate::multimodal::srt::Subtitle;
+use crate::range::Range;
 
 /// 帧到秒的换算系数：FFT_HOP = 256 采样 / 22050 Hz ≈ 0.01161 秒
 pub const FRAME_SEC: f64 = 256.0 / 22050.0;
@@ -176,7 +176,7 @@ pub fn load_subtitles_by_basename(
         };
 
         match path {
-            Some(p) => match crate::core::multimodal::srt::parse_srt_file(&p) {
+            Some(p) => match crate::multimodal::srt::parse_srt_file(&p) {
                 Ok(subs) => out.push(subs),
                 Err(e) => {
                     eprintln!("警告：解析字幕失败 {}: {e}", p.display());
@@ -192,7 +192,7 @@ pub fn load_subtitles_by_basename(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::range::Range;
+    use crate::range::Range;
 
     fn make_range(begin: i32, end: i32, score: f64) -> Range {
         Range {

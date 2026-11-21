@@ -3,7 +3,7 @@
 use egui::Context;
 
 use super::super::state::{SharedState, Thresholds};
-use crate::core::viterbi::ViterbiConfig;
+use abrmad_core::viterbi::ViterbiConfig;
 
 /// 显示阈值设置窗口
 pub fn show(ctx: &Context, state: &SharedState) {

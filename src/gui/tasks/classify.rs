@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-use crate::core::classify::model::load_model;
-use crate::core::classify::{ClassifyOptions, EventRange};
+use abrmad_core::classify::model::load_model;
+use abrmad_core::classify::{ClassifyOptions, EventRange};
 
 use super::super::state::SharedState;
 
@@ -93,7 +93,7 @@ pub(crate) fn start_classification(state: &SharedState) {
                     }
                 };
 
-                let (events, ok) = match crate::core::classify::classify_file_with_progress(
+                let (events, ok) = match abrmad_core::classify::classify_file_with_progress(
                     path,
                     &model,
                     &opts,

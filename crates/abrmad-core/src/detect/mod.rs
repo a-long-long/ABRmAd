@@ -17,20 +17,22 @@ pub mod scan;
 
 pub use merge::reverse_range;
 
-use anyhow::{Context, Result};
+#[cfg(feature = "cli")]
+use anyhow::Context;
+use anyhow::Result;
 use ndarray::Array2;
 use rayon::prelude::*;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::audio::{cache, ffmpeg};
-use crate::core::dsp::features::{self, AudioFeatures};
-use crate::core::dsp::fft::{self, FFT_LEN};
-use crate::core::dsp::separation::{self, HpssParams};
-use crate::core::matching::lsh;
-use crate::core::range::{Link, Range};
-use crate::core::viterbi::ViterbiConfig;
+use crate::dsp::features::{self, AudioFeatures};
+use crate::dsp::fft::{self, FFT_LEN};
+use crate::dsp::separation::{self, HpssParams};
+use crate::matching::lsh;
+use crate::range::{Link, Range};
+use crate::viterbi::ViterbiConfig;
+use abrmad_audio::{cache, ffmpeg};
 
 use merge::{calc_range_types, combine_to_ranges, compress_range};
 use refine::{fine_tune_multi, viterbi_filter_candidates};
@@ -55,7 +57,7 @@ pub struct DetectOptions {
     /// 默认 false → 正常检测。
     pub enable_vad: bool,
     /// VAD 参数；None 时用默认值（threshold=-30dBFS, 帧长=220, 最小静音帧=3）
-    pub vad_params: Option<crate::core::dsp::vad::VadParams>,
+    pub vad_params: Option<crate::dsp::vad::VadParams>,
     /// Viterbi DP 时序一致性过滤参数；None 时用内部默认值
     pub viterbi_config: Option<ViterbiConfig>,
     /// 是否启用**自适应特征权重**
@@ -91,9 +93,9 @@ pub struct MultimodalConfig {
     /// 已按文件名匹配并加载好的字幕列表。
     /// 顺序与 DetectResult.ranges 对齐：subs[i] 对应用第 i 个文件的字幕。
     /// 空 Vec 表示该文件没有字幕（跳过融合）。
-    pub loaded_subtitles: Vec<Vec<crate::core::multimodal::srt::Subtitle>>,
+    pub loaded_subtitles: Vec<Vec<crate::multimodal::srt::Subtitle>>,
     /// 融合参数（boost / penalty / keywords）
-    pub fusion_config: crate::core::multimodal::fusion::FusionConfig,
+    pub fusion_config: crate::multimodal::fusion::FusionConfig,
 }
 
 impl DetectOptions {
@@ -121,7 +123,7 @@ impl DetectOptions {
         self.enable_vad = true;
         self
     }
-    pub fn with_vad_params(mut self, params: crate::core::dsp::vad::VadParams) -> Self {
+    pub fn with_vad_params(mut self, params: crate::dsp::vad::VadParams) -> Self {
         self.enable_vad = true;
         self.vad_params = Some(params);
         self
@@ -421,13 +423,13 @@ where
     // 质量分用于 Phase 2 两两比对时的自适应融合权重
     let qualities: Vec<[f64; 4]> = feats
         .iter()
-        .map(|f| crate::core::dsp::features::feature_quality(f))
+        .map(|f| crate::dsp::features::feature_quality(f))
         .collect();
     let qualities = Arc::new(qualities);
 
     // Phase 1.5b: 三特征常驻 GPU（预算内），供 Phase 2 所有文件对复用
     // 无 GPU、文件过大或超出显存预算时返回 None，后续自动回退按对上传/CPU
-    let gpu_feats = crate::core::matching::gpu::feature_context(&feats, HASH_WINDOW_SIZE);
+    let gpu_feats = crate::matching::gpu::feature_context(&feats, HASH_WINDOW_SIZE);
 
     // Phase 2: 两两比对
     let cache_note = match &gpu_feats {
@@ -470,7 +472,7 @@ where
 
         // 2.4 自适应特征权重：取两文件质量分的几何平均 + softmax
         // 关闭自适应时回退固定权重 [0.40, 0.25, 0.15, 0.20]
-        let pair_w = crate::core::dsp::features::pair_weights(
+        let pair_w = crate::dsp::features::pair_weights(
             &qualities[i],
             &qualities[j],
             opts.enable_adaptive_weights,
@@ -570,7 +572,7 @@ where
                 if i >= ranges.len() || file_subs.is_empty() {
                     continue;
                 }
-                crate::core::multimodal::fusion::reweight_ranges(
+                crate::multimodal::fusion::reweight_ranges(
                     &mut ranges[i],
                     file_subs,
                     &mm.fusion_config,
@@ -601,7 +603,7 @@ where
         ranges,
         lengths,
         gpu: if gpu_used.load(Ordering::Relaxed) {
-            crate::core::matching::gpu::backend_name()
+            crate::matching::gpu::backend_name()
         } else {
             None
         },
@@ -655,7 +657,7 @@ fn apply_vad_to_hash(
     fft: &ndarray::Array2<f64>,
     hash: &mut [i32],
     enable_vad: bool,
-    vad_params: Option<&crate::core::dsp::vad::VadParams>,
+    vad_params: Option<&crate::dsp::vad::VadParams>,
 ) {
     if !enable_vad || hash.is_empty() {
         return;
@@ -777,7 +779,7 @@ pub(super) fn export_debug(
         fs::write(&energy_path, serde_json::to_string_pretty(&energies)?)?;
 
         // mel.png
-        let mel = crate::core::dsp::features::mel_spectrogram(fft);
+        let mel = crate::dsp::features::mel_spectrogram(fft);
         let (mel_frames, mel_bands) = mel.dim();
         if mel_frames > 0 && mel_bands > 0 {
             let (width, height) = (mel_frames.min(1920), mel_bands.min(512));

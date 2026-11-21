@@ -1,20 +1,11 @@
-//! ABRmAd Rust 核心库
+//! ABRmAd 应用层
 //!
-//! 提供音频广告检测和裁剪功能。代码分层：
-//! - [`core`]: 纯算法（频谱、LSH、特征、Viterbi、检测）
-//! - [`audio`]: FFmpeg 调用与检测缓存
-//! - [`pipeline`]: 检测到裁剪的高层编排
-//! - [`result_io`]: 检测结果文件读写
-//! - [`training`]: 事件分类模型训练
-//! - [`ffi`]: C ABI 接口
-//! - [`cli`] / [`gui`]: 需要对应 feature 的界面层
-
-pub mod audio;
-pub mod core;
-pub mod ffi;
-pub mod pipeline;
-pub mod result_io;
-pub mod training;
+//! 算法与 I/O 已拆分为独立 crate：
+//! - `abrmad_core`：纯算法（频谱、LSH、特征、Viterbi、检测）
+//! - `abrmad_audio`：FFmpeg 调用、缓存、流程编排、结果读写、模型训练
+//! - `abrmad_ffi`：C ABI 引擎动态库（`abrmad_rs.dll` / `libabrmad_rs.so`）
+//!
+//! 本 crate 只保留命令行与图形界面。
 
 #[cfg(feature = "cli")]
 pub mod cli;
@@ -22,10 +13,10 @@ pub mod cli;
 #[cfg(feature = "gui")]
 pub mod gui;
 
-// 重新导出主要接口
-pub use audio::ffmpeg::{audio_to_wav, cut_and_combine};
-pub use core::classify::model::ModelFile;
-pub use core::classify::{ClassifyOptions, EventRange};
-pub use core::detect::{detect_ad, reverse_range, DetectionResult};
-pub use core::range::Range;
-pub use pipeline::{collect_audio_files, cut_file, is_supported_audio, keep_segments};
+// 重新导出主要接口，界面层无需直接依赖底层 crate
+pub use abrmad_audio::{audio_to_wav, cut_and_combine};
+pub use abrmad_core::classify::model::ModelFile;
+pub use abrmad_core::classify::{ClassifyOptions, EventRange};
+pub use abrmad_core::detect::{detect_ad, reverse_range, DetectionResult};
+pub use abrmad_core::pipeline::{collect_audio_files, cut_file, is_supported_audio, keep_segments};
+pub use abrmad_core::Range;

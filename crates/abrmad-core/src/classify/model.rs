@@ -1,5 +1,5 @@
 use super::forest::Forest;
-use crate::core::dsp::segfeat::{SEG_FEATURE_DIM, SEG_SR};
+use crate::dsp::segfeat::{SEG_FEATURE_DIM, SEG_SR};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;

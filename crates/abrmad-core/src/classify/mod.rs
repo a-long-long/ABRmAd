@@ -5,10 +5,10 @@
 pub mod forest;
 pub mod model;
 
-use crate::audio::{cache, ffmpeg};
-use crate::core::classify::model::ModelFile;
-use crate::core::dsp::fft::read_wav_samples;
-use crate::core::dsp::segfeat::{extract_segment_features, SEG_N_FFT, SEG_SR};
+use crate::classify::model::ModelFile;
+use crate::dsp::fft::read_wav_samples;
+use crate::dsp::segfeat::{extract_segment_features, SEG_N_FFT, SEG_SR};
+use abrmad_audio::{cache, ffmpeg};
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
@@ -251,8 +251,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::classify::forest::{Forest, Node};
-    use crate::core::dsp::segfeat::SEG_FEATURE_DIM;
+    use crate::classify::forest::{Forest, Node};
+    use crate::dsp::segfeat::SEG_FEATURE_DIM;
 
     fn dummy_model(window_sec: f64) -> ModelFile {
         ModelFile {

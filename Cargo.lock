@@ -19,20 +19,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
-name = "abrmad-rs"
+name = "abrmad-audio"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ndarray",
+ "rand 0.8.8",
+]
+
+[[package]]
+name = "abrmad-core"
+version = "0.1.0"
+dependencies = [
+ "abrmad-audio",
+ "anyhow",
  "bincode",
  "bytemuck",
- "clap",
- "eframe",
- "egui",
- "env_logger",
  "hound",
  "image",
- "indicatif",
- "libc",
  "naga",
  "ndarray",
  "ndarray-rand",
@@ -40,13 +44,40 @@ dependencies = [
  "pollster",
  "rand 0.8.8",
  "rayon",
- "rfd",
- "rodio",
  "rustfft",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
  "wgpu",
+]
+
+[[package]]
+name = "abrmad-ffi"
+version = "0.1.0"
+dependencies = [
+ "abrmad-audio",
+ "abrmad-core",
+ "libc",
+]
+
+[[package]]
+name = "abrmad-rs"
+version = "0.1.0"
+dependencies = [
+ "abrmad-audio",
+ "abrmad-core",
+ "anyhow",
+ "clap",
+ "eframe",
+ "egui",
+ "env_logger",
+ "image",
+ "indicatif",
+ "ndarray",
+ "pollster",
+ "rand 0.8.8",
+ "rfd",
+ "rodio",
+ "serde_json",
  "windows-sys 0.52.0",
  "winres",
 ]

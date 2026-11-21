@@ -5,9 +5,9 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::audio::{cache, ffmpeg};
-use crate::core::detect::reverse_range;
-use crate::core::range::Range;
+use crate::detect::reverse_range;
+use crate::range::Range;
+use abrmad_audio::{cache, ffmpeg};
 
 /// 支持的音频扩展名（ffmpeg 可解码的常见格式）
 pub const SUPPORTED_EXTENSIONS: &[&str] =

@@ -2,10 +2,10 @@
 //!
 //! Viterbi 过滤剔除孤立候选，多特征相似度用于确定区间起止。
 
-use crate::core::dsp::features::{self, AudioFeatures};
-use crate::core::matching::gpu;
-use crate::core::range::{Link, Range};
-use crate::core::viterbi::{self, Candidate};
+use crate::dsp::features::{self, AudioFeatures};
+use crate::matching::gpu;
+use crate::range::{Link, Range};
+use crate::viterbi::{self, Candidate};
 
 use super::Thresholds;
 use super::HASH_WINDOW_SIZE;
@@ -620,7 +620,7 @@ pub(super) fn create_range(ranges: &mut Vec<Range>, len: usize, add: Range) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::dsp::fft::FREQ_BINS;
+    use crate::dsp::fft::FREQ_BINS;
     use ndarray::Array2;
 
     /// 自适应下限：锚点越强下限越高，但被夹在 [MIN, MAX] 之间
@@ -852,7 +852,7 @@ mod tests {
     /// 有 GPU 时：批量结果必须与 CPU 精确路径一致
     #[test]
     fn batch_best_matches_cpu_when_gpu_available() {
-        if crate::core::matching::gpu::backend_name().is_none() {
+        if crate::matching::gpu::backend_name().is_none() {
             eprintln!("未检测到可用 GPU，跳过");
             return;
         }

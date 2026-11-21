@@ -95,8 +95,8 @@ mod imp {
 
     /// 三特征加权融合相似度（未启用 GPU 时返回 None，由调用方走 CPU）
     pub fn fused_feature_sim(
-        _feat1: &crate::core::dsp::features::AudioFeatures,
-        _feat2: &crate::core::dsp::features::AudioFeatures,
+        _feat1: &crate::dsp::features::AudioFeatures,
+        _feat2: &crate::dsp::features::AudioFeatures,
         _pairs: &[(usize, usize)],
         _size: usize,
         _weights: [f64; 3],
@@ -128,7 +128,7 @@ mod imp {
 
     /// 未启用 GPU 时没有常驻上下文
     pub fn feature_context(
-        _feats: &[crate::core::dsp::features::AudioFeatures],
+        _feats: &[crate::dsp::features::AudioFeatures],
         _size: usize,
     ) -> Option<FeatureContext> {
         None
@@ -141,7 +141,7 @@ mod imp {
 
     use ndarray::Array2;
 
-    use crate::core::dsp::features::AudioFeatures;
+    use crate::dsp::features::AudioFeatures;
 
     /// 单个批次的最大配对数，避免一次提交过大
     const MAX_PAIRS_PER_BATCH: usize = 1 << 18;
@@ -1069,7 +1069,7 @@ mod imp {
             .iter()
             .enumerate()
             .step_by(step)
-            .filter(|(_, &h)| h != crate::core::matching::lsh::VAD_SILENCE_MARKER)
+            .filter(|(_, &h)| h != crate::matching::lsh::VAD_SILENCE_MARKER)
             .map(|(i, &h)| (i, h))
             .collect();
         if sampled.len() < MIN_SAMPLED_FOR_GPU {
@@ -1545,7 +1545,7 @@ pub use imp::{
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
     use super::*;
-    use crate::core::matching::lsh;
+    use crate::matching::lsh;
     use ndarray::Array2;
 
     /// 余弦相似度 shader 语法与类型校验（不需要 GPU 硬件）
@@ -1634,7 +1634,7 @@ mod tests {
     }
 
     /// 构造三特征矩阵（FFT 64 列、MFCC 13 列、Chroma 12 列，与真实维度一致）
-    fn make_features(rows: usize, seed: f64) -> crate::core::dsp::features::AudioFeatures {
+    fn make_features(rows: usize, seed: f64) -> crate::dsp::features::AudioFeatures {
         let fft = Array2::from_shape_fn((rows, 64), |(i, j)| {
             ((i * 7 + j * 3) as f64 * seed).sin() * 1.5
         });
@@ -1643,7 +1643,7 @@ mod tests {
         let chroma = Array2::from_shape_fn((rows, 12), |(i, j)| ((i * 3 + j) as f64 * seed).sin());
         let stats =
             Array2::from_shape_fn((rows, 3), |(i, j)| ((i * 11 + j * 5) as f64 * seed).sin());
-        crate::core::dsp::features::AudioFeatures {
+        crate::dsp::features::AudioFeatures {
             fft,
             mfcc,
             chroma,
@@ -1710,7 +1710,7 @@ mod tests {
 
         for &(i, j) in &[(0usize, 0usize), (3, 7), (12, 20), (35, 35)] {
             let model = model_fused(&a, &b, i, j, size, weights);
-            let cpu = crate::core::dsp::features::multi_feature_sim(&f1, &f2, i, j, size, &weights);
+            let cpu = crate::dsp::features::multi_feature_sim(&f1, &f2, i, j, size, &weights);
             assert!(
                 (model - cpu).abs() < 1e-4,
                 "pair ({i},{j}): model={model} cpu={cpu}"
@@ -1758,9 +1758,8 @@ mod tests {
             .expect("常驻路径应返回结果");
         assert_eq!(scores.len(), pairs.len());
         for (idx, &(i, j)) in pairs.iter().enumerate().take(64) {
-            let cpu = crate::core::dsp::features::multi_feature_sim(
-                &feats[0], &feats[1], i, j, size, &weights,
-            );
+            let cpu =
+                crate::dsp::features::multi_feature_sim(&feats[0], &feats[1], i, j, size, &weights);
             assert!(
                 (scores[idx] - cpu).abs() < 1e-4,
                 "pair {idx} ({i},{j}): ctx={} cpu={cpu}",
@@ -1791,7 +1790,7 @@ mod tests {
         let scores = fused_feature_sim(&f1, &f2, &pairs, size, weights).expect("GPU 应返回结果");
         assert_eq!(scores.len(), pairs.len());
         for (idx, &(i, j)) in pairs.iter().enumerate().take(256) {
-            let cpu = crate::core::dsp::features::multi_feature_sim(&f1, &f2, i, j, size, &weights);
+            let cpu = crate::dsp::features::multi_feature_sim(&f1, &f2, i, j, size, &weights);
             assert!(
                 (scores[idx] - cpu).abs() < 1e-4,
                 "pair {idx} ({i},{j}): gpu={} cpu={cpu}",

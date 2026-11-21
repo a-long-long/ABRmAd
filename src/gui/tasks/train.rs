@@ -4,8 +4,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::thread;
 
-use crate::audio::ffmpeg;
-use crate::training::{format_report, train_model, TrainConfig, TrainSample};
+use abrmad_audio::ffmpeg;
+use abrmad_core::training::{format_report, train_model, TrainConfig, TrainSample};
 
 use super::super::state::SharedState;
 
@@ -196,7 +196,7 @@ fn run_training(
         &config,
         &path,
         on_progress,
-        &crate::training::AugmentConfig::default(),
+        &abrmad_core::training::AugmentConfig::default(),
     ) {
         Ok(report) => {
             let mut s = state.lock().unwrap();

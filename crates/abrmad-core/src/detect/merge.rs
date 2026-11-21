@@ -2,7 +2,7 @@
 //!
 //! 负责把两两比对得到的区间压缩为不重叠结果，并通过连通分量计算出现次数。
 
-use crate::core::range::{Link, Range};
+use crate::range::{Link, Range};
 use std::collections::HashSet;
 
 use super::refine::create_range;

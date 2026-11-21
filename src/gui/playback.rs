@@ -17,7 +17,7 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use crate::core::range::Range;
+use abrmad_core::range::Range;
 
 use super::state::SharedState;
 

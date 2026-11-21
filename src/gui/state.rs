@@ -1,9 +1,9 @@
 //! GUI 状态模型
 
-use crate::core::classify::EventRange;
-use crate::core::range::Range;
-use crate::core::viterbi::ViterbiConfig;
-use crate::training::TrainSample;
+use abrmad_core::classify::EventRange;
+use abrmad_core::range::Range;
+use abrmad_core::training::TrainSample;
+use abrmad_core::viterbi::ViterbiConfig;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(segments(&cut), vec![(100, 200)]);
 
         // 保存时保留的是补集：删除段前后被拼接起来
-        let keep = crate::pipeline::keep_segments(&cut, 1000);
+        let keep = abrmad_core::pipeline::keep_segments(&cut, 1000);
         assert_eq!(keep, vec![(0, 100), (200, 1000)]);
     }
 

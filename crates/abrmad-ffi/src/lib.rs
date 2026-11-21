@@ -9,10 +9,10 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::slice;
 
-use crate::audio::ffmpeg;
-use crate::core::detect;
-use crate::core::range::Range;
-use crate::pipeline;
+use abrmad_audio::ffmpeg;
+use abrmad_core::detect;
+use abrmad_core::pipeline;
+use abrmad_core::range::Range;
 
 /// 构造错误 C 字符串（统一入口，避免 unwrap panic）
 fn error_cstring(msg: impl Into<String>) -> *mut c_char {

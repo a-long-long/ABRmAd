@@ -1,0 +1,43 @@
+name: build-dist
+
+# 在 Windows 与 Linux 上分别编译引擎动态库（abrmad_rs.dll / libabrmad_rs.so）
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  engine:
+    name: engine-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build engine cdylib
+        run: cargo build --release -p abrmad-ffi --features gpu
+
+      - name: Collect artifact (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force release/windows | Out-Null
+          Copy-Item target/release/abrmad_rs.dll release/windows/
+
+      - name: Collect artifact (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p release/linux
+          cp target/release/libabrmad_rs.so release/linux/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abrmad-engine-${{ runner.os }}
+          path: |
+            release/windows/abrmad_rs.dll
+            release/linux/libabrmad_rs.so
+          if-no-files-found: ignore

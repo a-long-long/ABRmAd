@@ -6,14 +6,14 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::audio::ffmpeg;
-use crate::core::classify::model::load_model;
-use crate::core::classify::{classify_file_with_progress, ClassifyOptions};
-use crate::core::detect::{detect_ad_with_progress, DetectOptions};
-use crate::core::dsp::separation::HpssParams;
-use crate::core::range::Range;
-use crate::training::{TrainConfig, TrainSample};
-use crate::{pipeline, result_io};
+use abrmad_audio::ffmpeg;
+use abrmad_core::classify::model::load_model;
+use abrmad_core::classify::{classify_file_with_progress, ClassifyOptions};
+use abrmad_core::detect::{detect_ad_with_progress, DetectOptions};
+use abrmad_core::dsp::separation::HpssParams;
+use abrmad_core::range::Range;
+use abrmad_core::training::{TrainConfig, TrainSample};
+use abrmad_core::{pipeline, result_io};
 
 #[derive(Parser)]
 #[command(name = "abrmad-rs")]
@@ -279,9 +279,9 @@ fn cmd_detect(
         println!("Debug 导出: {}", dir.display());
     }
     if let Some(srt) = srt_dir {
-        use crate::core::detect::MultimodalConfig;
-        use crate::core::multimodal::fusion::load_subtitles_by_basename;
-        use crate::core::multimodal::fusion::FusionConfig;
+        use abrmad_core::detect::MultimodalConfig;
+        use abrmad_core::multimodal::fusion::load_subtitles_by_basename;
+        use abrmad_core::multimodal::fusion::FusionConfig;
 
         let subs_per_file = load_subtitles_by_basename(files, srt);
         let matched = subs_per_file.iter().filter(|s| !s.is_empty()).count();
@@ -301,7 +301,7 @@ fn cmd_detect(
         });
     }
     if vad {
-        use crate::core::dsp::vad::VadParams;
+        use abrmad_core::dsp::vad::VadParams;
         let params = match vad_threshold {
             Some(t) => VadParams::new(t),
             None => VadParams::default(),
@@ -316,7 +316,7 @@ fn cmd_detect(
         );
     }
     if viterbi_max_drift.is_some() || viterbi_min_chain_score.is_some() {
-        use crate::core::viterbi::ViterbiConfig;
+        use abrmad_core::viterbi::ViterbiConfig;
         let mut cfg = ViterbiConfig::default();
         if let Some(d) = viterbi_max_drift {
             cfg.max_drift = d;
@@ -534,9 +534,9 @@ fn cmd_train(
     println!("训练随机森林事件分类模型...");
     println!("样本: {}, 标签: {:?}", samples.len(), labels);
     let augment_config = if augment {
-        crate::training::AugmentConfig::default_on()
+        abrmad_core::training::AugmentConfig::default_on()
     } else {
-        crate::training::AugmentConfig::default()
+        abrmad_core::training::AugmentConfig::default()
     };
     if augment_config.enable {
         println!(
@@ -556,7 +556,7 @@ fn cmd_train(
         ..Default::default()
     };
     let report =
-        crate::training::train_model(&samples, &config, output, |_, _| {}, &augment_config)?;
+        abrmad_core::training::train_model(&samples, &config, output, |_, _| {}, &augment_config)?;
 
     println!("窗口扩展后样本: {}", report.samples);
     println!("\n测试集评估:");

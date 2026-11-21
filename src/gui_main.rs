@@ -3,5 +3,5 @@
 #![windows_subsystem = "windows"]
 
 fn main() -> eframe::Result<()> {
-    abrmad_rs::gui::run()
+    abrmad_rs_app::gui::run()
 }

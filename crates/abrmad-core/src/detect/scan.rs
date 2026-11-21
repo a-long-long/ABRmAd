@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ndarray::Array2;
 
-use crate::core::matching::gpu;
-use crate::core::matching::lsh;
-use crate::core::matching::peaks;
+use crate::matching::gpu;
+use crate::matching::lsh;
+use crate::matching::peaks;
 
 use super::Thresholds;
 use super::HASH_WINDOW_SIZE;
@@ -40,7 +40,7 @@ pub(super) fn check_same_adaptive(
 ) -> Vec<(usize, usize, f64)> {
     // 候选生成：优先 GPU（排序 + 二分查找两遍 scan），不可用时回退 CPU HashMap。
     // 两条路径输出的 groups 顺序完全一致，不影响后续 tie-breaking。
-    let groups = match crate::core::matching::gpu::hash_filter(hash1, hash2, HASH_WINDOW_SIZE) {
+    let groups = match crate::matching::gpu::hash_filter(hash1, hash2, HASH_WINDOW_SIZE) {
         Some(g) => {
             gpu_used.store(true, Ordering::Relaxed);
             g
@@ -219,9 +219,7 @@ fn best_matches(
         pairs.extend(ps.iter().map(|&p| (f, p)));
     }
 
-    if let Some(scores) =
-        crate::core::matching::gpu::cosine_pairs(fft1, fft2, &pairs, HASH_WINDOW_SIZE)
-    {
+    if let Some(scores) = crate::matching::gpu::cosine_pairs(fft1, fft2, &pairs, HASH_WINDOW_SIZE) {
         gpu_used.store(true, Ordering::Relaxed);
         return gpu_best_matches_recheck(fft1, fft2, groups, &scores);
     }

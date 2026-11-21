@@ -17,8 +17,8 @@ use anyhow::{bail, Context, Result};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::core::detect::DetectionResult;
-use crate::core::range::Range;
+use crate::detect::DetectionResult;
+use crate::range::Range;
 
 /// 结果文件最多允许声明的文件数（防恶意/损坏文件触发 OOM）
 const MAX_FILES: usize = 10_000;

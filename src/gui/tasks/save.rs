@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
 
-use crate::pipeline;
+use abrmad_core::pipeline;
 
 use super::super::state::{AppState, FileInfo, SharedState};
 

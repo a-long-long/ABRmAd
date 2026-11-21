@@ -8,8 +8,8 @@ use ndarray::Array2;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::audio::cache;
-use crate::core::dsp::features::{self, MEL_BANDS};
+use abrmad_audio::cache;
+use abrmad_core::dsp::features::{self, MEL_BANDS};
 
 use super::super::state::{FileInfo, SharedState};
 

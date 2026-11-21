@@ -3,7 +3,7 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::thread;
 
-use crate::core::detect::{detect_ad_with_progress, DetectOptions};
+use abrmad_core::detect::{detect_ad_with_progress, DetectOptions};
 
 use super::super::state::{FileInfo, SharedState};
 
@@ -43,7 +43,7 @@ pub(crate) fn add_directory(state: &SharedState) {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let file_path = entry.path();
-                let is_audio = crate::pipeline::is_supported_audio(&file_path);
+                let is_audio = abrmad_core::pipeline::is_supported_audio(&file_path);
 
                 if is_audio && !s.files.iter().any(|f| f.path == file_path) {
                     s.files.push(FileInfo::from_path(file_path));
@@ -70,7 +70,7 @@ pub(crate) fn start_detection(state: &SharedState) {
             let (files, enable_hpss, viterbi_cfg): (
                 Vec<std::path::PathBuf>,
                 bool,
-                Option<crate::core::viterbi::ViterbiConfig>,
+                Option<abrmad_core::viterbi::ViterbiConfig>,
             ) = {
                 let s = state.lock().unwrap();
                 (
