@@ -27,12 +27,20 @@ const BOUNDARY_REFINE_THRESHOLD: f64 = 0.80;
 /// 边界精修时单侧最多收缩的帧数
 const BOUNDARY_REFINE_MAX_SHIFT: usize = 5;
 
-/// 区间扩展时核心特征（FFT 频谱 + MFCC 音色）各自必须达到的最低相似度
+/// 区间扩展时核心特征（FFT 频谱 + MFCC 音色）下限的自适应参数
 ///
 /// 只用加权和判据时，任何一路特征的虚高得分都能把总和撑到阈值之上，
 /// 导致匹配区间一路延长（曾出现几百秒的"相同片段"）。真实重复片段
-/// 必须在主频谱与音色上同时相似，因此这里对两路都设硬下限。
-const EXTEND_CORE_MIN: f64 = 0.55;
+/// 必须在主频谱与音色上同时相似，因此对两路都设下限。
+///
+/// 下限按**该候选锚点的匹配强度**自适应：干净素材本身相似度高，
+/// 下限收紧防止漂移到无关内容；噪声大/低码率素材锚点相似度低，
+/// 下限放宽以免把真实重复片段提前截断。
+const EXTEND_CORE_RATIO: f64 = 0.70;
+/// 自适应下限的下界（重压缩、噪声素材）
+const EXTEND_CORE_MIN: f64 = 0.45;
+/// 自适应下限的上界（高保真素材）
+const EXTEND_CORE_MAX: f64 = 0.75;
 /// 多特征融合权重：[FFT, MFCC, Chroma, Spectral Stats]
 /// Stats 包含 Centroid/Rolloff/Flux，能捕捉语音 vs 音乐 / 广告 jingle 的差异
 const FEATURE_WEIGHTS: [f64; 4] = [0.40, 0.25, 0.15, 0.20];
@@ -240,18 +248,29 @@ pub(super) fn viterbi_filter_candidates(
     }
 }
 
+/// 由锚点匹配强度推导核心特征下限
+///
+/// 锚点相似度高（干净素材）→ 下限收紧；锚点相似度低（噪声/低码率）→ 下限放宽。
+/// 结果被限制在 `[EXTEND_CORE_MIN, EXTEND_CORE_MAX]`。
+fn core_floor(seed_sim: f64) -> f64 {
+    (seed_sim * EXTEND_CORE_RATIO).clamp(EXTEND_CORE_MIN, EXTEND_CORE_MAX)
+}
+
 /// 核心特征是否同时达标（FFT 频谱 + MFCC 音色）
 ///
-/// 用于区间扩展的硬约束，防止单一特征的虚高得分把匹配区间拉长。
+/// 下限由调用方按锚点强度给出，用于区间扩展的硬约束，
+/// 防止单一特征的虚高得分把匹配区间拉长。
 fn core_features_agree(
     feat1: &AudioFeatures,
     feat2: &AudioFeatures,
     offset1: usize,
     offset2: usize,
+    floor_fft: f64,
+    floor_mfcc: f64,
 ) -> bool {
     let (fft_sim, mfcc_sim) =
         features::core_feature_sim(feat1, feat2, offset1, offset2, FINE_TUNE_WINDOW);
-    fft_sim >= EXTEND_CORE_MIN && mfcc_sim >= EXTEND_CORE_MIN
+    fft_sim >= floor_fft && mfcc_sim >= floor_mfcc
 }
 
 /// 多特征融合精细调整
@@ -302,6 +321,12 @@ pub(super) fn fine_tune_multi(
             None => best_p1_cpu(feat1, feat2, p1_init, p2, len1, weights),
         };
 
+        // 按锚点匹配强度推导本候选的核心特征下限（自适应）
+        let (seed_fft, seed_mfcc) =
+            features::core_feature_sim(feat1, feat2, p1, p2, FINE_TUNE_WINDOW);
+        let floor_fft = core_floor(seed_fft);
+        let floor_mfcc = core_floor(seed_mfcc);
+
         // 向后扩展
         let mut next = 0;
         while p1 + next + FINE_TUNE_WINDOW < len1 && p2 + next + FINE_TUNE_WINDOW < len2 {
@@ -313,7 +338,9 @@ pub(super) fn fine_tune_multi(
                 FINE_TUNE_WINDOW,
                 weights,
             );
-            if sim < ft || !core_features_agree(feat1, feat2, p1 + next, p2 + next) {
+            if sim < ft
+                || !core_features_agree(feat1, feat2, p1 + next, p2 + next, floor_fft, floor_mfcc)
+            {
                 break;
             }
             next += FINE_TUNE_STEP;
@@ -336,6 +363,8 @@ pub(super) fn fine_tune_multi(
                     feat2,
                     (p1 as i64 + prev) as usize,
                     (p2 as i64 + prev) as usize,
+                    floor_fft,
+                    floor_mfcc,
                 )
             {
                 prev += FINE_TUNE_WINDOW as i64 - 1;
@@ -590,6 +619,22 @@ mod tests {
     use super::*;
     use crate::core::dsp::fft::FREQ_BINS;
     use ndarray::Array2;
+
+    /// 自适应下限：锚点越强下限越高，但被夹在 [MIN, MAX] 之间
+    #[test]
+    fn core_floor_is_adaptive_and_bounded() {
+        // 低相似度锚点（噪声/低码率）→ 取下界
+        assert!((core_floor(0.2) - EXTEND_CORE_MIN).abs() < 1e-12);
+        assert!((core_floor(0.6) - EXTEND_CORE_MIN).abs() < 1e-12); // 0.42 < 0.45
+                                                                    // 中等锚点 → 按比例
+        let mid = core_floor(0.75); // 0.525
+        assert!((mid - 0.525).abs() < 1e-9, "mid floor = {}", mid);
+        // 高相似度锚点（高保真）→ 收紧但不超上界
+        assert!((core_floor(0.95) - 0.665).abs() < 1e-9);
+        assert!((core_floor(1.0) - 0.70).abs() < 1e-9);
+        // 单调性
+        assert!(core_floor(0.8) <= core_floor(0.9));
+    }
 
     fn frame_values(frame: usize, width: usize, salt: usize) -> Vec<f64> {
         (0..width)
