@@ -68,10 +68,21 @@ windows-sys = { version = "0.52", features = [
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 
+# 开发/测试构建：只保留行号表，显著减小 debuginfo（target 体积大头），
+# panic 回溯与基础断点仍可用，仅变量查看能力略降
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
+# 剥离符号，进一步减小发布产物（exe / dll / so）
+strip = true
 
 # 本机快速发布构建：thin LTO + 多 codegen 单元，编译更快，运行时略慢
 [profile.quick]

@@ -1,0 +1,14 @@
+# 构建级配置（项目级，已提交到仓库）
+# 参考全局惯例 skill: rust-target-slim
+
+[build]
+# 多 worktree / 多项目共享编译缓存时取消注释，指向项目外目录
+# target-dir = "../shared-target"
+
+# 装了 sccache 且端口可用时取消注释，跨项目复用编译缓存
+# 注意 Windows 可能被端口排除占用（os error 10013），失败时设空绕过：
+#   $env:CARGO_BUILD_RUSTC_WRAPPER=''
+# rustc-wrapper = "sccache"
+
+# 并行编译上限，默认 = CPU 核数；内存紧张时可调小
+# jobs = 4
